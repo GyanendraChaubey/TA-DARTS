@@ -1,0 +1,125 @@
+"""
+CLI entry point for MT-DARTS v2.
+
+Examples
+--------
+Full run on real MedMNIST data::
+
+    python main.py --epochs 50 --batch 64 --device cuda
+
+Quick smoke test with mock data::
+
+    python main.py --no-real --epochs 2 --batch 32 --device cpu
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+
+logger = logging.getLogger("MT-DARTS")
+
+try:
+    from sklearn.metrics import roc_auc_score  # noqa: F401
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="MT-DARTS v2: Multi-Task NAS on MedMNIST",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    g = parser.add_argument_group("Search Phase")
+    g.add_argument("--epochs",          type=int,   default=50,
+                   help="Number of search epochs")
+    g.add_argument("--batch",           type=int,   default=64,
+                   help="Batch size")
+    g.add_argument("--layers",          type=int,   default=6,
+                   help="Number of searchable layers")
+    g.add_argument("--channels",        type=int,   default=32,
+                   help="Feature map channel width")
+    g.add_argument("--lr_w",            type=float, default=0.025,
+                   help="Weight optimiser learning rate")
+    g.add_argument("--lr_a",            type=float, default=3e-4,
+                   help="Alpha optimiser learning rate")
+    g.add_argument("--log",             type=int,   default=25,
+                   help="Log every N gradient steps")
+    g.add_argument("--eval-every",      type=int,   default=1,
+                   help="Evaluate accuracy every N epochs")
+    g.add_argument("--ckpt-every",      type=int,   default=5,
+                   help="Save checkpoint every N epochs")
+    # Contrib. [B]
+    g.add_argument("--tau_init",        type=float, default=1.5,
+                   help="[B] Initial sparsemax temperature")
+    g.add_argument("--anneal_factor",   type=float, default=0.75,
+                   help="[B] Temperature annealing factor per interval")
+    g.add_argument("--anneal_interval", type=int,   default=5,
+                   help="[B] Epochs between temperature decay steps")
+    # Contrib. [C]
+    g.add_argument("--alpha_freq",      type=int,   default=10,
+                   help="[C] Update alpha every N weight steps")
+    # Contrib. [D]
+    g.add_argument("--entropy_thresh",  type=float, default=0.05,
+                   help="[D] Early-stop threshold on mean alpha entropy")
+
+    g2 = parser.add_argument_group("Retrain Phase")
+    g2.add_argument("--retrain_epochs", type=int,   default=100,
+                    help="Epochs for discrete model retraining")
+    g2.add_argument("--retrain_lr",     type=float, default=0.025,
+                    help="Learning rate for retraining")
+
+    g3 = parser.add_argument_group("Infrastructure")
+    g3.add_argument("--device",         type=str,   default="cpu",
+                    help="Device: cpu | cuda | mps")
+    g3.add_argument("--ckpt-dir",       type=str,   default="checkpoints")
+    g3.add_argument("--save-dir",       type=str,   default="./results",
+                    help="Directory for results and saved models")
+    g3.add_argument("--resume",         type=str,   default=None,
+                    help="Path to checkpoint to resume from")
+    g3.add_argument("--no-real",        action="store_true",
+                    help="Force mock data even if medmnist is installed")
+    g3.add_argument("--seed",           type=int,   default=42)
+    g3.add_argument("--workers",        type=int,   default=0,
+                    help="DataLoader num_workers")
+
+    return parser
+
+
+if __name__ == "__main__":
+    from train import run_search
+
+    args = build_parser().parse_args()
+
+    if not _HAS_SKLEARN:
+        logger.warning(
+            "scikit-learn not installed — AUC metrics will be NaN. "
+            "Install with: pip install scikit-learn"
+        )
+
+    run_search(
+        num_epochs        = args.epochs,
+        batch_size        = args.batch,
+        num_layers        = args.layers,
+        channels          = args.channels,
+        lr_weights        = args.lr_w,
+        lr_alphas         = args.lr_a,
+        retrain_epochs    = args.retrain_epochs,
+        retrain_lr        = args.retrain_lr,
+        log_interval      = args.log,
+        eval_interval     = args.eval_every,
+        ckpt_interval     = args.ckpt_every,
+        ckpt_dir          = args.ckpt_dir,
+        save_dir          = args.save_dir,
+        resume_from       = args.resume,
+        use_real_data     = not args.no_real,
+        device_str        = args.device,
+        seed              = args.seed,
+        num_workers       = args.workers,
+        tau_init          = args.tau_init,
+        anneal_factor     = args.anneal_factor,
+        anneal_interval   = args.anneal_interval,
+        alpha_update_freq = args.alpha_freq,
+        entropy_threshold = args.entropy_thresh,
+    )

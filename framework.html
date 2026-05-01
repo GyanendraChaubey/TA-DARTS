@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="MT-DARTS — Multi-task Differentiable Architecture Search framework for medical imaging">
+    <title>MT-DARTS Framework</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #EDE7F6 0%, #E0F7FA 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+            color: #1A237E;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.08);
+            overflow: hidden;
+        }
+
+        .header {
+            padding: 40px;
+            border-bottom: 2px solid #512DA8;
+            background: linear-gradient(135deg, #D1C4E9 0%, #B2DFDB 100%);
+        }
+
+        h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+            color: #1A237E;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: #004D40;
+            font-weight: 400;
+        }
+
+        .diagram-container {
+            padding: 40px;
+            background: #ffffff;
+            overflow-x: auto;
+            border-top: 2px solid #512DA8;
+        }
+
+        .diagram-container svg {
+            max-width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .footer {
+            padding: 20px 40px;
+            background: #EDE7F6;
+            border-top: 1px solid #512DA8;
+            font-size: 12px;
+            color: #4527A0;
+            text-align: center;
+            font-style: italic;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 20px 10px;
+            }
+
+            .header {
+                padding: 24px;
+            }
+
+            h1 {
+                font-size: 20px;
+            }
+
+            .subtitle {
+                font-size: 12px;
+            }
+
+            .diagram-container {
+                padding: 20px;
+            }
+
+            .footer {
+                padding: 16px 20px;
+                font-size: 11px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>MT-DARTS Framework</h1>
+            <p class="subtitle">Multi-task Differentiable Architecture Search for medical imaging</p>
+        </div>
+
+        <div class="diagram-container">
+            <svg width="100%" viewBox="0 0 680 1560" role="img" xmlns="http://www.w3.org/2000/svg"
+  style="font-family: system-ui, sans-serif; background: white;">
+  <title>MT-DARTS Framework Diagram</title>
+  <desc>End-to-end multi-task differentiable architecture search pipeline for MedMNIST, showing four phases: bilevel search, discretization, retraining, and evaluation.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: system-ui, -apple-system, sans-serif; fill: #1A237E; }
+      .th  { font-size: 13px; font-weight: 600; }
+      .ts  { font-size: 11px; font-weight: 400; fill: #37474F; }
+      .tm  { font-size: 11px; font-style: italic; fill: #1A237E; }
+      .c-purple rect, .c-purple circle { fill: #D1C4E9; stroke: #512DA8; }
+      .c-purple .th { fill: #311B92; }
+      .c-purple .ts { fill: #4527A0; }
+      .c-purple .tm { fill: #4527A0; }
+      .c-teal rect, .c-teal circle { fill: #B2DFDB; stroke: #00796B; }
+      .c-teal .th { fill: #004D40; }
+      .c-teal .ts { fill: #00695C; }
+      .c-teal .tm { fill: #00695C; }
+      .c-amber rect, .c-amber circle { fill: #FFE082; stroke: #F57F17; }
+      .c-amber .th { fill: #E65100; }
+      .c-amber .ts { fill: #BF360C; }
+      .c-amber .tm { fill: #E65100; }
+      .c-coral rect { fill: #FFCCBC; stroke: #BF360C; }
+      .c-coral .th  { fill: #7F0000; }
+      .c-gray rect { fill: #CFD8DC; stroke: #546E7A; }
+      .c-gray .th  { fill: #263238; }
+      .c-gray .ts  { fill: #37474F; }
+      .c-gray .tm  { fill: #1A237E; }
+      .dash-purple { fill: none; stroke: #512DA8; stroke-width: 1.5; stroke-dasharray: 5 4; opacity: 0.8; }
+      .dash-amber  { fill: none; stroke: #F57F17; stroke-width: 1.5; stroke-dasharray: 5 4; opacity: 0.75; }
+      .dash-gray   { fill: none; stroke: #546E7A; stroke-width: 1.5; stroke-dasharray: 5 4; opacity: 0.65; }
+      line, path.arr { fill: none; stroke: #546E7A; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <!-- HEADER -->
+  <text class="th" x="340" y="28" text-anchor="middle" font-size="16">MT-DARTS &#x2014; Multi-Task Differentiable Architecture Search</text>
+  <text class="tm" x="340" y="48" text-anchor="middle" font-size="12">min<tspan baseline-shift="sub" font-size="9" font-style="normal">w</tspan> min<tspan baseline-shift="sub" font-size="9" font-style="normal">&#x03B1;</tspan> &#x2113;<tspan baseline-shift="sub" font-size="9" font-style="normal">val</tspan>(w*(&#x03B1;),&#x03B1;)&#x2002;&#x2002;s.t.&#x2002;&#x2002;w*(&#x03B1;) = argmin<tspan baseline-shift="sub" font-size="9" font-style="normal">w</tspan> &#x2113;<tspan baseline-shift="sub" font-size="9" font-style="normal">train</tspan>(w,&#x03B1;)</text>
+
+  <!-- Legend -->
+  <g class="c-purple"><rect x="40"  y="62" width="11" height="11" rx="2" stroke-width="0.5"/></g>
+  <text class="ts" x="57"  y="72">Search / model</text>
+  <g class="c-teal">  <rect x="158" y="62" width="11" height="11" rx="2" stroke-width="0.5"/></g>
+  <text class="ts" x="175" y="72">Data &#x1D49F;</text>
+  <g class="c-amber">  <rect x="222" y="62" width="11" height="11" rx="2" stroke-width="0.5"/></g>
+  <text class="ts" x="239" y="72">Optimisation</text>
+  <g class="c-coral">  <rect x="336" y="62" width="11" height="11" rx="2" stroke-width="0.5"/></g>
+  <text class="ts" x="353" y="72">Phase</text>
+  <g class="c-gray">   <rect x="400" y="62" width="11" height="11" rx="2" stroke-width="0.5"/></g>
+  <text class="ts" x="417" y="72">Output</text>
+
+  <!-- STEP 0 -->
+  <text class="ts" x="340" y="96" text-anchor="middle" font-style="italic">Step 0 &#x2014; Setup:&#x2002;&#x1D4AF; = {0,1,2},&#x2002;T = 3,&#x2002;&#x1D49F; = &#x22C3;<tspan baseline-shift="sub" font-size="9">k&#x2208;&#x1D4AF;</tspan> &#x1D49F;<tspan baseline-shift="sub" font-size="9">k</tspan></text>
+
+  <!-- Dataset boxes -->
+  <g class="c-teal">
+    <rect x="40" y="108" width="168" height="62" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="127" text-anchor="middle">&#x1D49F;<tspan baseline-shift="sub" font-size="9">0</tspan> &#x2014; PathMNIST</text>
+    <text class="ts" x="124" y="143" text-anchor="middle">y &#x2208; {0,&#x2026;,8},&#x2002;|&#x1D49E;<tspan baseline-shift="sub" font-size="8">0</tspan>| = 9</text>
+    <text class="tm" x="124" y="160" text-anchor="middle">single-label&#x2002;&#x2113;<tspan baseline-shift="sub" font-size="8">0</tspan> = CE</text>
+  </g>
+  <g class="c-teal">
+    <rect x="256" y="108" width="168" height="62" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="127" text-anchor="middle">&#x1D49F;<tspan baseline-shift="sub" font-size="9">1</tspan> &#x2014; ChestMNIST</text>
+    <text class="ts" x="340" y="143" text-anchor="middle">y &#x2208; {0,1}<tspan baseline-shift="super" font-size="8">14</tspan>,&#x2002;|&#x1D49E;<tspan baseline-shift="sub" font-size="8">1</tspan>| = 14</text>
+    <text class="tm" x="340" y="160" text-anchor="middle">multi-label&#x2002;&#x2113;<tspan baseline-shift="sub" font-size="8">1</tspan> = BCE</text>
+  </g>
+  <g class="c-teal">
+    <rect x="472" y="108" width="168" height="62" rx="8" stroke-width="0.5"/>
+    <text class="th" x="556" y="127" text-anchor="middle">&#x1D49F;<tspan baseline-shift="sub" font-size="9">2</tspan> &#x2014; DermaMNIST</text>
+    <text class="ts" x="556" y="143" text-anchor="middle">y &#x2208; {0,&#x2026;,6},&#x2002;|&#x1D49E;<tspan baseline-shift="sub" font-size="8">2</tspan>| = 7</text>
+    <text class="tm" x="556" y="160" text-anchor="middle">single-label&#x2002;&#x2113;<tspan baseline-shift="sub" font-size="8">2</tspan> = CE</text>
+  </g>
+
+  <line x1="124" y1="170" x2="278" y2="200" stroke="#1D9E75" marker-end="url(#arrow)"/>
+  <line x1="340" y1="170" x2="340" y2="200" stroke="#1D9E75" marker-end="url(#arrow)"/>
+  <line x1="556" y1="170" x2="402" y2="200" stroke="#1D9E75" marker-end="url(#arrow)"/>
+
+  <!-- Unified pipeline -->
+  <g class="c-teal">
+    <rect x="196" y="202" width="288" height="58" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="221" text-anchor="middle">Task-aware data pipeline</text>
+    <text class="ts" x="340" y="237" text-anchor="middle">batch &#x212C; = {(x<tspan baseline-shift="sub" font-size="8">i</tspan>, y<tspan baseline-shift="sub" font-size="8">i</tspan>, k<tspan baseline-shift="sub" font-size="8">i</tspan>)}<tspan baseline-shift="sub" font-size="8">i=1</tspan><tspan baseline-shift="super" font-size="8">B</tspan>,&#x2002;k<tspan baseline-shift="sub" font-size="8">i</tspan> &#x2208; &#x1D4AF;</text>
+    <text class="tm" x="340" y="252" text-anchor="middle">mixed-task collation with per-sample task routing</text>
+  </g>
+
+  <line x1="284" y1="260" x2="212" y2="288" stroke="#1D9E75" marker-end="url(#arrow)"/>
+  <line x1="340" y1="260" x2="340" y2="288" stroke="#1D9E75" marker-end="url(#arrow)"/>
+  <line x1="396" y1="260" x2="468" y2="288" stroke="#1D9E75" marker-end="url(#arrow)"/>
+
+  <g class="c-teal">
+    <rect x="106" y="290" width="138" height="50" rx="8" stroke-width="0.5"/>
+    <text class="th" x="175" y="309" text-anchor="middle">&#x212C;<tspan baseline-shift="sub" font-size="9">train</tspan></text>
+    <text class="tm" x="175" y="330" text-anchor="middle">&#x2207;<tspan baseline-shift="sub" font-size="8">w</tspan> &#x2113;&#x2002;(weight step)</text>
+  </g>
+  <g class="c-teal">
+    <rect x="271" y="290" width="138" height="50" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="309" text-anchor="middle">&#x212C;<tspan baseline-shift="sub" font-size="9">val</tspan></text>
+    <text class="tm" x="340" y="330" text-anchor="middle">&#x2207;<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan> &#x2113;&#x2002;(&#x03B1; step)</text>
+  </g>
+  <g class="c-teal">
+    <rect x="436" y="290" width="138" height="50" rx="8" stroke-width="0.5"/>
+    <text class="th" x="505" y="309" text-anchor="middle">&#x212C;<tspan baseline-shift="sub" font-size="9">test</tspan></text>
+    <text class="ts" x="505" y="330" text-anchor="middle">final evaluation</text>
+  </g>
+
+  <!-- SUPERNET -->
+  <text class="ts" x="340" y="362" text-anchor="middle" font-style="italic">Supernet f(x; w, &#x03B1;):&#x2002;shared stem &#x03C6; &#x2192; L MixedOp cells &#x2192; task head h<tspan baseline-shift="sub" font-size="8">k</tspan></text>
+
+  <rect class="dash-purple" x="40" y="372" width="600" height="224" rx="14"/>
+  <text class="ts" x="56" y="388" font-style="italic">TaskAwareSupernet&#x2002;(&#x03B1; &#x2208; &#x211D;<tspan baseline-shift="super" font-size="8">T&#xD7;L&#xD7;O</tspan>)</text>
+
+  <g class="c-purple">
+    <rect x="60" y="396" width="152" height="62" rx="8" stroke-width="0.5"/>
+    <text class="th" x="136" y="415" text-anchor="middle">Shared stem &#x03C6;</text>
+    <text class="ts" x="136" y="431" text-anchor="middle">Conv2d(3&#x2192;C) + BN + ReLU</text>
+    <text class="tm" x="136" y="447" text-anchor="middle">h<tspan baseline-shift="sub" font-size="8">0</tspan> = &#x03C6;(x) &#x2208; &#x211D;<tspan baseline-shift="super" font-size="8">C&#xD7;H&#xD7;W</tspan></text>
+  </g>
+
+  <line x1="212" y1="427" x2="230" y2="427" stroke="#534AB7" marker-end="url(#arrow)"/>
+
+  <g class="c-purple">
+    <rect x="230" y="382" width="196" height="144" rx="10" stroke-width="0.5"/>
+    <text class="th" x="328" y="401" text-anchor="middle">L MixedOp cells</text>
+    <text class="tm" x="328" y="417" text-anchor="middle">h<tspan baseline-shift="sub" font-size="8">&#x2113;+1</tspan> = &#x2211;<tspan baseline-shift="sub" font-size="8">o</tspan><tspan baseline-shift="super" font-size="8">O</tspan> &#x03C0;<tspan baseline-shift="sub" font-size="8">t,&#x2113;,o</tspan> &#xB7; op<tspan baseline-shift="sub" font-size="8">o</tspan>(h<tspan baseline-shift="sub" font-size="8">&#x2113;</tspan>)</text>
+    <rect x="234" y="428" width="80" height="20" rx="5" stroke-width="0.5"/>
+    <text class="ts" x="274" y="442" text-anchor="middle" font-size="9">MBConv<tspan baseline-shift="super" font-size="6">3&#xD7;3</tspan></text>
+    <rect x="318" y="428" width="80" height="20" rx="5" stroke-width="0.5"/>
+    <text class="ts" x="358" y="442" text-anchor="middle" font-size="9">MBConv<tspan baseline-shift="super" font-size="6">5&#xD7;5</tspan></text>
+    <rect x="402" y="428" width="20" height="20" rx="5" stroke-width="0.5"/>
+    <text class="ts" x="412" y="442" text-anchor="middle" font-size="9">0</text>
+    <rect x="238" y="454" width="108" height="20" rx="5" stroke-width="0.5"/>
+    <text class="ts" x="292" y="468" text-anchor="middle" font-size="9">DilConv<tspan baseline-shift="super" font-size="6">3&#xD7;3</tspan>(d=2)</text>
+    <rect x="352" y="454" width="72" height="20" rx="5" stroke-width="0.5"/>
+    <text class="ts" x="388" y="468" text-anchor="middle" font-size="9">SkipConnect</text>
+    <text class="ts" x="328" y="506" text-anchor="middle" font-size="10" font-style="italic">|&#x1D4AA;| = O = 5 ops per layer</text>
+  </g>
+
+  <line x1="426" y1="454" x2="438" y2="424" stroke="#534AB7" marker-end="url(#arrow)"/>
+  <line x1="426" y1="454" x2="438" y2="456" stroke="#534AB7" marker-end="url(#arrow)"/>
+  <line x1="426" y1="454" x2="438" y2="494" stroke="#534AB7" marker-end="url(#arrow)"/>
+
+  <g class="c-purple">
+    <rect x="438" y="402" width="196" height="44" rx="8" stroke-width="0.5"/>
+    <text class="th" x="536" y="420" text-anchor="middle">h<tspan baseline-shift="sub" font-size="8">0</tspan>: PathMNIST (C<tspan baseline-shift="sub" font-size="8">0</tspan>=9)</text>
+    <text class="tm" x="536" y="438" text-anchor="middle">&#x2113;<tspan baseline-shift="sub" font-size="8">0</tspan> = &#x2212;&#x2211;<tspan baseline-shift="sub" font-size="8">c</tspan> y<tspan baseline-shift="sub" font-size="8">c</tspan> log p<tspan baseline-shift="sub" font-size="8">c</tspan>&#x2002;(CE)</text>
+  </g>
+  <g class="c-purple">
+    <rect x="438" y="450" width="196" height="44" rx="8" stroke-width="0.5"/>
+    <text class="th" x="536" y="468" text-anchor="middle">h<tspan baseline-shift="sub" font-size="8">1</tspan>: ChestMNIST (C<tspan baseline-shift="sub" font-size="8">1</tspan>=14)</text>
+    <text class="tm" x="536" y="486" text-anchor="middle">&#x2113;<tspan baseline-shift="sub" font-size="8">1</tspan> = &#x2212;&#x2211;<tspan baseline-shift="sub" font-size="8">c</tspan>[y<tspan baseline-shift="sub" font-size="8">c</tspan> log &#x03C3;(z<tspan baseline-shift="sub" font-size="8">c</tspan>)+(1&#x2212;y<tspan baseline-shift="sub" font-size="8">c</tspan>)log(1&#x2212;&#x03C3;(z<tspan baseline-shift="sub" font-size="8">c</tspan>))]</text>
+  </g>
+  <g class="c-purple">
+    <rect x="438" y="498" width="196" height="44" rx="8" stroke-width="0.5"/>
+    <text class="th" x="536" y="516" text-anchor="middle">h<tspan baseline-shift="sub" font-size="8">2</tspan>: DermaMNIST (C<tspan baseline-shift="sub" font-size="8">2</tspan>=7)</text>
+    <text class="tm" x="536" y="534" text-anchor="middle">&#x2113;<tspan baseline-shift="sub" font-size="8">2</tspan> = &#x2212;&#x2211;<tspan baseline-shift="sub" font-size="8">c</tspan> y<tspan baseline-shift="sub" font-size="8">c</tspan> log p<tspan baseline-shift="sub" font-size="8">c</tspan>&#x2002;(CE)</text>
+  </g>
+
+  <!-- alpha annotations -->
+  <text class="tm" x="56" y="556" font-size="11">&#x03B1; &#x2208; &#x211D;<tspan baseline-shift="super" font-size="8">T&#xD7;L&#xD7;O</tspan>&#x2002;&#x2014;&#x2002;arch. logits,&#x2002;init &#x03B1; ~ &#x1D4A9;(0, 10<tspan baseline-shift="super" font-size="8">&#x2212;6</tspan> I)</text>
+  <text class="tm" x="56" y="572" font-size="11">&#x03C0;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan> = Sparsemax(&#x03B1;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan>/&#x03C4;) = argmin<tspan baseline-shift="sub" font-size="8">p&#x2208;&#x394;</tspan> &#x2016;p &#x2212; &#x03B1;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan>/&#x03C4;&#x2016;<tspan baseline-shift="super" font-size="8">2</tspan></text>
+  <text class="tm" x="56" y="588" font-size="11">h<tspan baseline-shift="sub" font-size="8">&#x2113;+1</tspan><tspan baseline-shift="super" font-size="8">(t)</tspan> = &#x2211;<tspan baseline-shift="sub" font-size="8">o</tspan> &#x03C0;<tspan baseline-shift="sub" font-size="8">t,&#x2113;,o</tspan> &#xB7; op<tspan baseline-shift="sub" font-size="8">o</tspan>(h<tspan baseline-shift="sub" font-size="8">&#x2113;</tspan>),&#x2002;&#x2200;&#x2113; &#x2208; {0,&#x2026;,L&#x2212;1}</text>
+
+  <!-- PHASE A -->
+  <g class="c-coral">
+    <rect x="40" y="606" width="180" height="26" rx="13" stroke-width="0.5"/>
+    <text class="th" x="130" y="623" text-anchor="middle">Phase A &#x2014; Bilevel Search</text>
+  </g>
+  <text class="tm" x="232" y="622" font-size="11">w* = argmin<tspan baseline-shift="sub" font-size="8">w</tspan> &#x2113;<tspan baseline-shift="sub" font-size="8">train</tspan>&#x2002;;&#x2002;&#x03B1;* = argmin<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan> &#x2113;<tspan baseline-shift="sub" font-size="8">val</tspan>(w*(&#x03B1;),&#x03B1;)</text>
+
+  <rect class="dash-amber" x="40" y="640" width="600" height="314" rx="14"/>
+  <text class="ts" x="56" y="656" font-style="italic">&#x2200; epoch e &#x2208; {1,&#x2026;,E}&#x2002;(inner loop over mini-batches s)</text>
+
+  <g class="c-amber">
+    <rect x="58" y="666" width="210" height="68" rx="8" stroke-width="0.5"/>
+    <text class="th" x="163" y="684" text-anchor="middle">&#x2460; Weight step</text>
+    <text class="tm" x="163" y="700" text-anchor="middle">g<tspan baseline-shift="sub" font-size="8">w</tspan> = &#x2207;<tspan baseline-shift="sub" font-size="8">w</tspan> &#x2113;<tspan baseline-shift="sub" font-size="8">train</tspan>(w, &#x03B1;)&#x2002;on &#x212C;<tspan baseline-shift="sub" font-size="8">train</tspan></text>
+    <text class="ts" x="163" y="716" text-anchor="middle">w &#x2190; SGD-Momentum(w, g<tspan baseline-shift="sub" font-size="8">w</tspan>) + cosine LR</text>
+    <text class="ts" x="163" y="728" text-anchor="middle" font-size="9" font-style="italic">clip: &#x2016;g<tspan baseline-shift="sub" font-size="7">w</tspan>&#x2016;&#x2082; &#x2264; G = 5.0</text>
+  </g>
+
+  <line x1="268" y1="700" x2="294" y2="700" stroke="#BA7517" marker-end="url(#arrow)"/>
+
+  <g class="c-amber">
+    <rect x="294" y="666" width="200" height="68" rx="8" stroke-width="0.5"/>
+    <text class="th" x="394" y="684" text-anchor="middle">&#x2461; &#x03B1; update?</text>
+    <text class="tm" x="394" y="700" text-anchor="middle">s mod f<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan> = 0</text>
+    <text class="ts" x="394" y="716" text-anchor="middle">f<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan> = alpha_update_freq</text>
+    <text class="ts" x="394" y="728" text-anchor="middle" font-size="9" font-style="italic">delayed arch. updates</text>
+  </g>
+
+  <line x1="494" y1="700" x2="522" y2="700" stroke="#BA7517" marker-end="url(#arrow)"/>
+  <text class="ts" x="500" y="696" font-size="10">yes</text>
+
+  <g class="c-amber">
+    <rect x="522" y="666" width="110" height="68" rx="8" stroke-width="0.5"/>
+    <text class="th" x="577" y="684" text-anchor="middle">&#x2462; &#x03B1; step</text>
+    <text class="tm" x="577" y="700" text-anchor="middle">g<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan> = &#x2207;<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan> &#x2113;<tspan baseline-shift="sub" font-size="8">val</tspan></text>
+    <text class="ts" x="577" y="716" text-anchor="middle">on &#x212C;<tspan baseline-shift="sub" font-size="8">val</tspan></text>
+    <text class="tm" x="577" y="728" text-anchor="middle">&#x03B1; &#x2190; Adam(&#x03B1;, g<tspan baseline-shift="sub" font-size="8">&#x03B1;</tspan>)</text>
+  </g>
+
+  <line x1="310" y1="734" x2="205" y2="758" stroke="#BA7517" marker-end="url(#arrow)"/>
+  <text class="ts" x="226" y="752" font-size="10">no: skip &#x03B1;</text>
+  <line x1="577" y1="734" x2="503" y2="758" stroke="#BA7517" marker-end="url(#arrow)"/>
+
+  <g class="c-amber">
+    <rect x="58" y="758" width="294" height="62" rx="8" stroke-width="0.5"/>
+    <text class="th" x="205" y="776" text-anchor="middle">Sparsemax projection</text>
+    <text class="tm" x="205" y="793" text-anchor="middle">&#x03C0;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan> = argmin<tspan baseline-shift="sub" font-size="8">p&#x2208;&#x394;</tspan> &#x2016;p &#x2212; &#x03B1;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan>/&#x03C4;&#x2016;<tspan baseline-shift="super" font-size="8">2</tspan></text>
+    <text class="ts" x="205" y="812" text-anchor="middle">&#x394;<tspan baseline-shift="super" font-size="8">O&#x2212;1</tspan> = {p: p&#x2265;0, &#x2211;p<tspan baseline-shift="sub" font-size="8">o</tspan>=1}&#x2002;&#x2014;&#x2002;exact zeros for suppressed ops</text>
+  </g>
+
+  <g class="c-amber">
+    <rect x="372" y="758" width="262" height="62" rx="8" stroke-width="0.5"/>
+    <text class="th" x="503" y="776" text-anchor="middle">Temperature schedule</text>
+    <text class="tm" x="503" y="793" text-anchor="middle">&#x03C4;<tspan baseline-shift="sub" font-size="8">e</tspan> = max( &#x03C4;<tspan baseline-shift="sub" font-size="8">0</tspan>&#xB7;&#x03BB;<tspan baseline-shift="super" font-size="8">&#x230A;e/m&#x230B;</tspan>,&#x2002;&#x03B5;<tspan baseline-shift="sub" font-size="8">&#x03C4;</tspan> )</text>
+    <text class="ts" x="503" y="812" text-anchor="middle">&#x03C4;<tspan baseline-shift="sub" font-size="8">0</tspan>=1.5,&#x2002;&#x03BB;=0.75,&#x2002;m=5,&#x2002;&#x03B5;<tspan baseline-shift="sub" font-size="8">&#x03C4;</tspan>=0.01&#x2002;(&#x03C4;&#x2192;0 &#x21D2; argmax)</text>
+  </g>
+
+  <line x1="372" y1="789" x2="354" y2="789" stroke="#BA7517" marker-end="url(#arrow)"/>
+  <line x1="205" y1="820" x2="205" y2="842" stroke="#BA7517" marker-end="url(#arrow)"/>
+  <line x1="503" y1="820" x2="503" y2="842" stroke="#BA7517" marker-end="url(#arrow)"/>
+  <g class="c-amber">
+    <rect x="144" y="842" width="392" height="64" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="861" text-anchor="middle">Entropy-based early stopping</text>
+    <text class="tm" x="340" y="879" text-anchor="middle">&#x210B;(&#x03C0;) = &#x2212;(1/TL)&#x2002;&#x2211;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan>&#x2002;&#x2211;<tspan baseline-shift="sub" font-size="8">o</tspan> &#x03C0;<tspan baseline-shift="sub" font-size="8">t,&#x2113;,o</tspan> log &#x03C0;<tspan baseline-shift="sub" font-size="8">t,&#x2113;,o</tspan></text>
+    <text class="ts" x="340" y="897" text-anchor="middle">stop if &#x210B;(&#x03C0;) &lt; &#x03B5;<tspan baseline-shift="sub" font-size="8">H</tspan>&#x2002;or&#x2002;e = E&#x2002;&#x2014;&#x2002;&#x210B;=0 &#x27FA; one-hot weights</text>
+  </g>
+  <text class="ts" x="58" y="944" font-style="italic">&#x21BB; repeat until &#x210B;(&#x03C0;) &lt; &#x03B5;<tspan baseline-shift="sub" font-size="8">H</tspan> or max epochs reached</text>
+
+  <!-- PHASE B -->
+  <line x1="340" y1="952" x2="340" y2="968" stroke="#888780" marker-end="url(#arrow)"/>
+
+  <g class="c-coral">
+    <rect x="40" y="964" width="210" height="26" rx="13" stroke-width="0.5"/>
+    <text class="th" x="145" y="981" text-anchor="middle">Phase B &#x2014; Discretisation</text>
+  </g>
+  <text class="tm" x="262" y="981" font-size="11">&#x2200;t&#x2208;&#x1D4AF;,&#x2200;&#x2113;:&#x2002;o&#x0302;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan> = argmax<tspan baseline-shift="sub" font-size="8">o&#x2208;&#x1D4AA;</tspan> &#x03B1;<tspan baseline-shift="sub" font-size="8">t,&#x2113;,o</tspan></text>
+
+  <rect class="dash-purple" x="40" y="998" width="600" height="154" rx="14"/>
+
+  <g class="c-purple">
+    <rect x="82" y="1008" width="516" height="60" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="1026" text-anchor="middle">Argmax discretisation</text>
+    <text class="tm" x="340" y="1044" text-anchor="middle">o&#x0302;<tspan baseline-shift="sub" font-size="8">t,&#x2113;</tspan> = argmax<tspan baseline-shift="sub" font-size="8">o&#x2208;&#x1D4AA;</tspan> &#x03B1;<tspan baseline-shift="sub" font-size="8">t,&#x2113;,o</tspan>,&#x2002;&#x2200;t&#x2208;&#x1D4AF;,&#x2002;&#x2200;&#x2113;&#x2208;{0,&#x2026;,L&#x2212;1}</text>
+    <text class="ts" x="340" y="1060" text-anchor="middle">yields T=3 discrete sequences (o&#x0302;<tspan baseline-shift="sub" font-size="8">t,0</tspan>,&#x2026;,o&#x0302;<tspan baseline-shift="sub" font-size="8">t,L&#x2212;1</tspan>), one per task</text>
+  </g>
+
+  <line x1="220" y1="1068" x2="146" y2="1094" stroke="#534AB7" marker-end="url(#arrow)"/>
+  <line x1="340" y1="1068" x2="340" y2="1094" stroke="#534AB7" marker-end="url(#arrow)"/>
+  <line x1="460" y1="1068" x2="536" y2="1094" stroke="#534AB7" marker-end="url(#arrow)"/>
+
+  <g class="c-purple">
+    <rect x="44"  y="1094" width="184" height="50" rx="8" stroke-width="0.5"/>
+    <text class="th" x="136" y="1112" text-anchor="middle">f&#x0302;<tspan baseline-shift="sub" font-size="9">0</tspan>&#x2002;(Path)</text>
+    <text class="tm" x="136" y="1134" text-anchor="middle">stem + {op<tspan baseline-shift="sub" font-size="8">o&#x0302;<tspan baseline-shift="sub" font-size="6">0,&#x2113;</tspan></tspan>}<tspan baseline-shift="sub" font-size="8">&#x2113;</tspan> + h<tspan baseline-shift="sub" font-size="8">0</tspan></text>
+  </g>
+  <g class="c-purple">
+    <rect x="248" y="1094" width="184" height="50" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="1112" text-anchor="middle">f&#x0302;<tspan baseline-shift="sub" font-size="9">1</tspan>&#x2002;(Chest)</text>
+    <text class="tm" x="340" y="1134" text-anchor="middle">stem + {op<tspan baseline-shift="sub" font-size="8">o&#x0302;<tspan baseline-shift="sub" font-size="6">1,&#x2113;</tspan></tspan>}<tspan baseline-shift="sub" font-size="8">&#x2113;</tspan> + h<tspan baseline-shift="sub" font-size="8">1</tspan></text>
+  </g>
+  <g class="c-purple">
+    <rect x="452" y="1094" width="184" height="50" rx="8" stroke-width="0.5"/>
+    <text class="th" x="544" y="1112" text-anchor="middle">f&#x0302;<tspan baseline-shift="sub" font-size="9">2</tspan>&#x2002;(Derma)</text>
+    <text class="tm" x="544" y="1134" text-anchor="middle">stem + {op<tspan baseline-shift="sub" font-size="8">o&#x0302;<tspan baseline-shift="sub" font-size="6">2,&#x2113;</tspan></tspan>}<tspan baseline-shift="sub" font-size="8">&#x2113;</tspan> + h<tspan baseline-shift="sub" font-size="8">2</tspan></text>
+  </g>
+
+  <!-- PHASE C -->
+  <line x1="170" y1="1144" x2="286" y2="1170" stroke="#888780" marker-end="url(#arrow)"/>
+  <line x1="340" y1="1144" x2="340" y2="1170" stroke="#888780" marker-end="url(#arrow)"/>
+  <line x1="510" y1="1144" x2="394" y2="1170" stroke="#888780" marker-end="url(#arrow)"/>
+
+  <g class="c-coral">
+    <rect x="40" y="1166" width="230" height="26" rx="13" stroke-width="0.5"/>
+    <text class="th" x="155" y="1183" text-anchor="middle">Phase C &#x2014; Retrain from scratch</text>
+  </g>
+  <text class="tm" x="282" y="1183" font-size="11">&#x2200;t&#x2208;&#x1D4AF;:&#x2002;w<tspan baseline-shift="sub" font-size="8">t</tspan>* = argmin<tspan baseline-shift="sub" font-size="8">w</tspan> &#x2113;<tspan baseline-shift="sub" font-size="8">t</tspan>(f&#x0302;<tspan baseline-shift="sub" font-size="8">t</tspan>(&#xB7;;w), &#x1D49F;<tspan baseline-shift="sub" font-size="8">t,train</tspan>)</text>
+
+  <rect class="dash-purple" x="40" y="1200" width="600" height="96" rx="14"/>
+
+  <g class="c-purple">
+    <rect x="58" y="1212" width="164" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="140" y="1230" text-anchor="middle">Re-init w ~ P<tspan baseline-shift="sub" font-size="8">init</tspan></text>
+    <text class="ts" x="140" y="1246" text-anchor="middle">Kaiming / Gaussian</text>
+    <text class="ts" x="140" y="1258" text-anchor="middle">no supernet weights</text>
+  </g>
+
+  <line x1="222" y1="1240" x2="248" y2="1240" stroke="#534AB7" marker-end="url(#arrow)"/>
+
+  <g class="c-purple">
+    <rect x="248" y="1212" width="164" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="330" y="1230" text-anchor="middle">Train f&#x0302;<tspan baseline-shift="sub" font-size="8">t</tspan> on &#x1D49F;<tspan baseline-shift="sub" font-size="8">t</tspan></text>
+    <text class="ts" x="330" y="1246" text-anchor="middle">SGD + cosine LR</text>
+    <text class="ts" x="330" y="1258" text-anchor="middle">task-k samples only</text>
+  </g>
+
+  <line x1="412" y1="1240" x2="438" y2="1240" stroke="#534AB7" marker-end="url(#arrow)"/>
+
+  <g class="c-purple">
+    <rect x="438" y="1212" width="164" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="520" y="1230" text-anchor="middle">w<tspan baseline-shift="sub" font-size="8">t</tspan>* = argmax<tspan baseline-shift="sub" font-size="8">e</tspan> AUC<tspan baseline-shift="sub" font-size="8">val</tspan>(e)</text>
+    <text class="ts" x="520" y="1246" text-anchor="middle">best val-AUC checkpoint</text>
+    <text class="ts" x="520" y="1258" text-anchor="middle">restore before test eval</text>
+  </g>
+
+  <text class="ts" x="340" y="1306" text-anchor="middle" font-style="italic">Repeat independently &#x2200;k&#x2208;{0,1,2} &#x2014; 3 separate training runs</text>
+
+  <!-- PHASE D -->
+  <g class="c-coral">
+    <rect x="40" y="1322" width="212" height="26" rx="13" stroke-width="0.5"/>
+    <text class="th" x="146" y="1339" text-anchor="middle">Phase D &#x2014; Benchmark report</text>
+  </g>
+
+  <rect class="dash-gray" x="40" y="1356" width="600" height="106" rx="14"/>
+
+  <g class="c-gray">
+    <rect x="56"  y="1368" width="176" height="82" rx="8" stroke-width="0.5"/>
+    <text class="th" x="144" y="1386" text-anchor="middle">Per-task metrics</text>
+    <text class="tm" x="144" y="1403" text-anchor="middle">Acc<tspan baseline-shift="sub" font-size="8">k</tspan> = |{y&#x0302;=y}| / |&#x1D49F;<tspan baseline-shift="sub" font-size="8">k,test</tspan>|</text>
+    <text class="tm" x="144" y="1419" text-anchor="middle">AUC<tspan baseline-shift="sub" font-size="8">k</tspan> = ROC-AUC (OvR)</text>
+    <text class="ts" x="144" y="1438" text-anchor="middle">&#x2113;<tspan baseline-shift="sub" font-size="8">k,test</tspan> per task</text>
+  </g>
+  <g class="c-gray">
+    <rect x="252" y="1368" width="176" height="82" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="1386" text-anchor="middle">Macro averages</text>
+    <text class="tm" x="340" y="1403" text-anchor="middle">Acc&#x0305; = (1/T) &#x2211;<tspan baseline-shift="sub" font-size="8">k</tspan> Acc<tspan baseline-shift="sub" font-size="8">k</tspan></text>
+    <text class="tm" x="340" y="1419" text-anchor="middle">AUC&#x0305; = (1/T) &#x2211;<tspan baseline-shift="sub" font-size="8">k</tspan> AUC<tspan baseline-shift="sub" font-size="8">k</tspan></text>
+    <text class="ts" x="340" y="1438" text-anchor="middle">over T = 3 tasks</text>
+  </g>
+  <g class="c-gray">
+    <rect x="448" y="1368" width="176" height="82" rx="8" stroke-width="0.5"/>
+    <text class="th" x="536" y="1386" text-anchor="middle">Saved artifacts</text>
+    <text class="ts" x="536" y="1403" text-anchor="middle">benchmark_results.json</text>
+    <text class="ts" x="536" y="1419" text-anchor="middle">benchmark_table.txt</text>
+    <text class="ts" x="536" y="1438" text-anchor="middle">discrete_*_best.pt</text>
+  </g>
+
+  <line x1="340" y1="1360" x2="174" y2="1368" stroke="#5F5E5A" marker-end="url(#arrow)"/>
+  <line x1="340" y1="1312" x2="340" y2="1368" stroke="#5F5E5A" marker-end="url(#arrow)"/>
+  <line x1="340" y1="1360" x2="508" y2="1368" stroke="#5F5E5A" marker-end="url(#arrow)"/>
+
+  <!-- Footer -->
+  <text class="ts" x="340" y="1482" text-anchor="middle" opacity="0.6">Architecture search (w, &#x03B1;) and final retraining (w only) are fully separated &#x2014; standard DARTS evaluation protocol</text>
+  <text class="ts" x="340" y="1498" text-anchor="middle" opacity="0.6">Sparsemax: Martins &amp; Astudillo, &#x201C;From Softmax to Sparsemax&#x201D;, ICML 2016</text>
+
+</svg>
+        </div>
+
+        <div class="footer">
+            Architecture search and final retraining are separated — standard DARTS evaluation convention
+        </div>
+    </div>
+</body>
+</html>
