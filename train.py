@@ -13,6 +13,7 @@ Entry points:
 """
 from __future__ import annotations
 
+import csv
 import logging
 import os
 import time
@@ -81,6 +82,13 @@ def run_search(
     set_seed(seed)
     device = torch.device(device_str)
     os.makedirs(save_dir, exist_ok=True)
+
+    # ── CSV writer for search training curves (Fix 2+5) ──────────────────────
+    csv_path = os.path.join(save_dir, "search_curves.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "PathMNIST_auc", "ChestMNIST_auc",
+                         "DermaMNIST_auc", "alpha_entropy", "tau"])
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader_bilevel, eval_loader = build_dataloaders(
@@ -186,7 +194,11 @@ def run_search(
         )
 
         if epoch % eval_interval == 0:
-            evaluate(model, eval_loader, device, split_name=f"epoch{epoch}")
+            eval_results = evaluate(
+                model, eval_loader, device, split_name=f"epoch{epoch}"
+            )
+        else:
+            eval_results = None
 
         if epoch % ckpt_interval == 0:
             controller.save_checkpoint(
@@ -199,6 +211,20 @@ def run_search(
         logger.info(
             f"  Mean alpha entropy: {ent:.4f} (threshold={entropy_threshold})"
         )
+
+        # ── Write training curves to CSV (Fix 2+5) ───────────────────────────
+        if eval_results is not None:
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch,
+                    f"{eval_results.get(0, {}).get('auc', float('nan')):.4f}",
+                    f"{eval_results.get(1, {}).get('auc', float('nan')):.4f}",
+                    f"{eval_results.get(2, {}).get('auc', float('nan')):.4f}",
+                    f"{ent:.6f}",
+                    f"{controller._current_tau:.4f}",
+                ])
+
         if ent < entropy_threshold:
             logger.info(
                 f"  ▶ Early stopping: entropy {ent:.4f} < {entropy_threshold}"
@@ -213,6 +239,24 @@ def run_search(
         f"  |  stopped at epoch {early_stopped_epoch}/{num_epochs}"
     )
     controller.log_arch_distribution()
+
+    # ── Save per-task architecture snapshot to file (Fix 6) ───────────────────
+    arch_snapshot_path = os.path.join(save_dir, "architecture_snapshot.txt")
+    with open(arch_snapshot_path, "w") as f:
+        from src.normalizers import annealed_sparsemax as _sp
+        _soft = _sp(model.alphas, tau=controller._current_tau)
+        for t in range(model.num_tasks):
+            tname = MedMNISTDataset.TASK_NAMES.get(t, f"Task{t}")
+            best  = model.alphas[t].argmax(dim=-1).tolist()
+            arch  = [OP_NAMES[i] for i in best]
+            f.write(f"{tname}: {arch}\n")
+            for lay in range(model.num_layers):
+                probs = _soft[t, lay].tolist()
+                bar   = "  ".join(f"{OP_NAMES[i][:10]:10s}={p:.3f}"
+                                  for i, p in enumerate(probs))
+                f.write(f"  Layer {lay}: {bar}\n")
+            f.write("\n")
+    logger.info(f"  Architecture snapshot saved → {arch_snapshot_path}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE B: Discretise

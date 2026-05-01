@@ -158,10 +158,12 @@ def retrain_discrete(
 
             if use_mixup and is_multilabel:
                 # Mix float multi-hot label vectors directly for BCE.
+                from .losses import _CHEST_POS_WEIGHT
                 lbl_a = torch.stack(labels_k).to(device)
                 lbl_b = torch.stack(labels_k_shuf).to(device)
                 loss  = F.binary_cross_entropy_with_logits(
                     logits, lam * lbl_a + (1.0 - lam) * lbl_b,
+                    pos_weight=_CHEST_POS_WEIGHT.to(device),
                 )
             elif use_mixup:
                 # Weighted sum of CE losses for the two mixed classes.

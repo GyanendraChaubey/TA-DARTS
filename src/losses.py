@@ -12,6 +12,19 @@ from torch import Tensor
 
 from .supernet import TaskAwareSupernet
 
+# ── Per-task class weights ────────────────────────────────────────────────────
+# DermaMNIST (task 2) has severe class imbalance — melanocytic nevi (~67%).
+# Inverse-frequency weights push the model to learn minority classes.
+# Source: MedMNIST v2 official class distribution for DermaMNIST.
+_DERMA_CLASS_WEIGHTS = torch.tensor(
+    [1.0, 1.0, 1.0, 1.0, 5.0, 1.0, 2.0],   # rough inverse-freq
+    dtype=torch.float32,
+)
+
+# ChestMNIST (task 1) — 14 binary labels, mostly negative.
+# pos_weight reweights the positive class in BCEWithLogitsLoss.
+_CHEST_POS_WEIGHT = torch.ones(14) * 10.0
+
 
 def task_loss(
     logits:          Tensor,
@@ -26,10 +39,12 @@ def task_loss(
     Multi-label tasks (ChestMNIST, task_id in MULTILABEL_TASKS):
         BCEWithLogitsLoss — sigmoid applied internally for numerical stability.
         Labels must be float multi-hot vectors. label_smoothing not applied.
+        pos_weight applied to reweight sparse positive labels.
 
     Single-label tasks (PathMNIST, DermaMNIST):
         CrossEntropyLoss — standard multi-class classification.
         label_smoothing applied when > 0.
+        DermaMNIST uses class weights to handle imbalance.
 
     Args:
         logits          : Model output, shape (B, num_classes).
@@ -45,10 +60,24 @@ def task_loss(
             lbl_t = torch.stack(labels).to(device)
         else:
             lbl_t = labels.to(device)
-        return F.binary_cross_entropy_with_logits(logits, lbl_t.float())
+        return F.binary_cross_entropy_with_logits(
+            logits,
+            lbl_t.float(),
+            pos_weight=_CHEST_POS_WEIGHT.to(device),
+        )
     else:
         if isinstance(labels, Tensor):
             lbl_t = labels.to(device)
         else:
             lbl_t = torch.tensor(labels, dtype=torch.long, device=device)
-        return F.cross_entropy(logits, lbl_t, label_smoothing=label_smoothing)
+
+        # DermaMNIST (task 2): apply class weights to handle imbalance.
+        weight = None
+        if task_id == 2:
+            weight = _DERMA_CLASS_WEIGHTS.to(device)
+
+        return F.cross_entropy(
+            logits, lbl_t,
+            weight=weight,
+            label_smoothing=label_smoothing,
+        )
