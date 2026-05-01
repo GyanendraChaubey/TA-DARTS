@@ -1,7 +1,8 @@
 """
-Primitive operations for the 5-op search space, plus MixedOp.
+Primitive operations for the 7-op search space, plus MixedOp.
 
-Search space:  MBConv3x3 | MBConv5x5 | DilatedConv3x3 | SkipConnect | Zero
+Search space:  MBConv3x3 | MBConv5x5 | MBConvSE | DilatedConv3x3 | SepConv5x5
+             | SkipConnect | Zero
 """
 from __future__ import annotations
 
@@ -97,6 +98,62 @@ class DilatedConv3x3(nn.Module):
         return self.op(x) + x
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention."""
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        mid = max(_make_divisible(channels // reduction), 4)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * self.fc(x).unsqueeze(-1).unsqueeze(-1)
+
+
+class MBConvSE(nn.Module):
+    """MBConv3x3 with Squeeze-and-Excitation attention — best for texture tasks."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        hidden = _make_divisible(channels * 4)
+        self.conv = nn.Sequential(
+            _ConvBNReLU(channels, hidden, ks=1),
+            _ConvBNReLU(hidden, hidden, ks=3, groups=hidden),
+            nn.Conv2d(hidden, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.se = SEBlock(channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.se(self.conv(x)) + x
+
+
+class SepConv5x5(nn.Module):
+    """Depthwise-separable 5×5 conv — wider receptive field for skin lesions."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.op = nn.Sequential(
+            nn.Conv2d(channels, channels, 5, padding=2,
+                      groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU6(inplace=True),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.op(x) + x
+
+
 class SkipConnect(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return x
@@ -119,16 +176,20 @@ class Zero(nn.Module):
 OP_NAMES: List[str] = [
     "MBConv3x3",
     "MBConv5x5",
+    "MBConvSE",
     "DilatedConv3x3",
+    "SepConv5x5",
     "SkipConnect",
     "Zero",
 ]
-NUM_OPS = len(OP_NAMES)
+NUM_OPS = len(OP_NAMES)  # 7
 
 _OP_REGISTRY = {
     "MBConv3x3":      MBConv3x3,
     "MBConv5x5":      MBConv5x5,
+    "MBConvSE":       MBConvSE,
     "DilatedConv3x3": DilatedConv3x3,
+    "SepConv5x5":     SepConv5x5,
     "SkipConnect":    lambda c: SkipConnect(),
     "Zero":           lambda c: Zero(),
 }

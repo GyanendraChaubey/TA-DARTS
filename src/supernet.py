@@ -39,13 +39,15 @@ class TaskAwareSupernet(nn.Module):
         self,
         num_tasks:            int            = 3,
         num_layers:           int            = 6,
-        channels:             int            = 32,
+        channels:             int            = 64,
         num_classes_per_task: Optional[List[int]] = None,
+        img_size:             int            = 64,
     ) -> None:
         super().__init__()
         self.num_tasks  = num_tasks
         self.num_layers = num_layers
         self.channels   = channels
+        self.img_size   = img_size
 
         if num_classes_per_task is None:
             num_classes_per_task = [9, 14, 7]
@@ -54,21 +56,38 @@ class TaskAwareSupernet(nn.Module):
         )
         self.num_classes = num_classes_per_task
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU6(inplace=True),
-        )
+        # Adaptive stem: 64×64 → 16×16 via two stride-2 convs (efficiency).
+        # Falls back to a single conv for 28×28 (smoke-test compat).
+        if img_size > 32:
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, channels // 2, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(channels // 2),
+                nn.ReLU6(inplace=True),
+                nn.Conv2d(channels // 2, channels, 3, stride=2, padding=1,
+                          bias=False),
+                nn.BatchNorm2d(channels),
+                nn.ReLU6(inplace=True),
+            )
+        else:
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.ReLU6(inplace=True),
+            )
         self.cells = nn.ModuleList(
             [MixedOp(channels) for _ in range(num_layers)]
         )
-        # Per-task heads with Dropout for regularisation.
+        # Deeper heads: GAP → Dropout(0.3) → FC(4C) → ReLU → Dropout(0.2) → FC(nc)
+        hidden_dim = max(channels * 4, 256)
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
+                nn.Dropout(p=0.3),
+                nn.Linear(channels, hidden_dim),
+                nn.ReLU(inplace=True),
                 nn.Dropout(p=0.2),
-                nn.Linear(channels, nc),
+                nn.Linear(hidden_dim, nc),
             )
             for nc in num_classes_per_task
         ])
@@ -90,11 +109,14 @@ class TaskAwareSupernet(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out",
                                         nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     # ── Forward ───────────────────────────────────────────────────────────────
 

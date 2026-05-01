@@ -58,6 +58,7 @@ class SearchController:
         anneal_factor:     float = 0.75,
         anneal_interval:   int   = 5,
         alpha_update_freq: int   = 10,
+        label_smoothing:   float = 0.0,
     ) -> None:
         self.model             = model
         self.grad_clip         = grad_clip
@@ -72,6 +73,9 @@ class SearchController:
 
         # Contrib. [C] — delayed alpha updates
         self.alpha_update_freq = alpha_update_freq
+
+        # Label smoothing for CE tasks during search
+        self.label_smoothing   = label_smoothing
 
         self.opt_weights = torch.optim.SGD(
             model.weight_parameters(),
@@ -115,7 +119,8 @@ class SearchController:
                         for i in mask.nonzero(as_tuple=True)[0].tolist()]
             # Contrib. [A][B]: forward with current annealed tau
             logits_k = self.model(imgs_k, k, tau=self._current_tau)
-            loss_k   = task_loss(logits_k, labels_k, k, device)
+            loss_k   = task_loss(logits_k, labels_k, k, device,
+                                 self.label_smoothing)
             total_loss = total_loss + loss_k * mask.sum()
             n_samples += mask.sum().item()
 

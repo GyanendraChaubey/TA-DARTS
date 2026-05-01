@@ -67,6 +67,9 @@ def run_search(
     device_str:        str          = "cpu",
     seed:              int          = 42,
     num_workers:       int          = 0,
+    img_size:          int          = 64,
+    mixup_alpha:       float        = 0.2,
+    label_smoothing:   float        = 0.1,
 ) -> Dict[str, Any]:
     """
     Execute the full MT-DARTS v2 pipeline and return benchmark results.
@@ -85,6 +88,7 @@ def run_search(
         num_workers=num_workers,
         use_real_data=use_real_data,
         seed=seed,
+        img_size=img_size,
     )
 
     # ── Model & controller ────────────────────────────────────────────────────
@@ -93,6 +97,7 @@ def run_search(
         num_layers=num_layers,
         channels=channels,
         num_classes_per_task=[9, 14, 7],
+        img_size=img_size,
     ).to(device)
 
     controller = SearchController(
@@ -104,6 +109,7 @@ def run_search(
         anneal_factor=anneal_factor,
         anneal_interval=anneal_interval,
         alpha_update_freq=alpha_update_freq,
+        label_smoothing=label_smoothing,
     )
 
     start_epoch = 1
@@ -240,6 +246,8 @@ def run_search(
             lr=retrain_lr,
             device=device,
             save_dir=save_dir,
+            mixup_alpha=mixup_alpha,
+            label_smoothing=label_smoothing,
         )
         result["architecture"] = architectures[k]
         benchmark_results[k]   = result

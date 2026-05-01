@@ -14,26 +14,29 @@ from .supernet import TaskAwareSupernet
 
 
 def task_loss(
-    logits:  Tensor,
+    logits:          Tensor,
     labels,          # int scalar | float Tensor [num_classes] | list thereof
-    task_id: int,
-    device:  torch.device,
+    task_id:         int,
+    device:          torch.device,
+    label_smoothing: float = 0.0,
 ) -> Tensor:
     """
     Route to the correct loss function per task.
 
     Multi-label tasks (ChestMNIST, task_id in MULTILABEL_TASKS):
         BCEWithLogitsLoss — sigmoid applied internally for numerical stability.
-        Labels must be float multi-hot vectors.
+        Labels must be float multi-hot vectors. label_smoothing not applied.
 
     Single-label tasks (PathMNIST, DermaMNIST):
         CrossEntropyLoss — standard multi-class classification.
+        label_smoothing applied when > 0.
 
     Args:
-        logits  : Model output, shape (B, num_classes).
-        labels  : Ground-truth — a scalar int, a tensor, or a list thereof.
-        task_id : Determines loss function and label dtype.
-        device  : Target device for label tensors.
+        logits          : Model output, shape (B, num_classes).
+        labels          : Ground-truth — a scalar int, a tensor, or a list.
+        task_id         : Determines loss function and label dtype.
+        device          : Target device for label tensors.
+        label_smoothing : Smoothing factor for CE tasks (0 = disabled).
     """
     if task_id in TaskAwareSupernet.MULTILABEL_TASKS:
         if isinstance(labels, Tensor):
@@ -48,4 +51,4 @@ def task_loss(
             lbl_t = labels.to(device)
         else:
             lbl_t = torch.tensor(labels, dtype=torch.long, device=device)
-        return F.cross_entropy(logits, lbl_t)
+        return F.cross_entropy(logits, lbl_t, label_smoothing=label_smoothing)

@@ -29,27 +29,35 @@ _TASK_STD: dict = {
 }
 
 
-def _get_transforms(task_id: int, train: bool):
+def _get_transforms(task_id: int, train: bool, img_size: int = 64):
     """
     Return a callable torchvision transform for one task.
     Gracefully degrades to a no-op if torchvision is absent.
 
-    Train: random flip + colour jitter + normalise.
-    Eval : normalise only.
+    Train: resize (if needed) + flips + strong colour jitter
+           + RandAugment + RandomErasing + normalise.
+    Eval : resize (if needed) + normalise only.
     """
     try:
         import torchvision.transforms as T
-        mean = _TASK_MEAN[task_id]
-        std  = _TASK_STD[task_id]
+        mean   = _TASK_MEAN[task_id]
+        std    = _TASK_STD[task_id]
+        resize = [T.Resize((img_size, img_size))] if img_size != 28 else []
         if train:
             return T.Compose([
+                *resize,
                 T.RandomHorizontalFlip(),
                 T.RandomVerticalFlip(),
-                T.ColorJitter(brightness=0.2, contrast=0.2,
-                              saturation=0.1, hue=0.05),
+                T.ColorJitter(brightness=0.3, contrast=0.3,
+                              saturation=0.2, hue=0.05),
+                # RandAugment requires uint8; convert, augment, convert back.
+                T.ConvertImageDtype(torch.uint8),
+                T.RandAugment(num_ops=2, magnitude=9),
+                T.ConvertImageDtype(torch.float32),
+                T.RandomErasing(p=0.2, scale=(0.02, 0.10)),
                 T.Normalize(mean=mean, std=std),
             ])
-        return T.Compose([T.Normalize(mean=mean, std=std)])
+        return T.Compose([*resize, T.Normalize(mean=mean, std=std)])
     except ImportError:
         return lambda x: x   # no-op fallback
 
@@ -76,13 +84,15 @@ class MedMNISTDataset(Dataset):
         num_mock_samples: int  = 1200,
         seed:             int  = 42,
         use_real:         bool = True,
+        img_size:         int  = 64,
     ) -> None:
         super().__init__()
         self.split    = split
         self.is_train = (split == "train")
+        self.img_size = img_size
 
         self.transforms = {
-            k: _get_transforms(k, train=self.is_train)
+            k: _get_transforms(k, train=self.is_train, img_size=img_size)
             for k in self.NUM_CLASSES
         }
         self.images:   List[Tensor] = []
@@ -111,7 +121,7 @@ class MedMNISTDataset(Dataset):
             (DermaMNIST, 2, split),
         ]
         for cls, task_id, s in sources:
-            ds = cls(split=s, download=True, as_rgb=True, size=28)
+            ds = cls(split=s, download=True, as_rgb=True, size=self.img_size)
             for img_np, lbl_np in zip(ds.imgs, ds.labels):
                 t = torch.from_numpy(img_np).float() / 255.0
                 if t.dim() == 2:          # grayscale (H, W) → (1, H, W)
@@ -146,10 +156,10 @@ class MedMNISTDataset(Dataset):
         for i in range(n):
             task_id = i % num_tasks
             if self.IS_GRAYSCALE[task_id]:
-                gray = torch.rand(1, 28, 28, generator=rng)
+                gray = torch.rand(1, self.img_size, self.img_size, generator=rng)
                 img  = gray.repeat(3, 1, 1)
             else:
-                img  = torch.rand(3, 28, 28, generator=rng)
+                img  = torch.rand(3, self.img_size, self.img_size, generator=rng)
 
             img = self.transforms[task_id](img)
 
@@ -196,6 +206,7 @@ def build_dataloaders(
     num_workers:   int  = 0,
     use_real_data: bool = True,
     seed:          int  = 42,
+    img_size:      int  = 64,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Construct and return ``(train_loader, val_bilevel_loader, eval_loader)``.
@@ -205,13 +216,17 @@ def build_dataloaders(
     - ``eval_loader``         — no shuffle, drop_last=False (metric evaluation).
     """
     train_ds = MedMNISTDataset("train", num_mock_samples=1600,
-                               seed=seed,     use_real=use_real_data)
+                               seed=seed,     use_real=use_real_data,
+                               img_size=img_size)
     val_ds   = MedMNISTDataset("val",   num_mock_samples=400,
-                               seed=seed + 1, use_real=use_real_data)
+                               seed=seed + 1, use_real=use_real_data,
+                               img_size=img_size)
     test_ds  = MedMNISTDataset("test",  num_mock_samples=400,
-                               seed=seed + 2, use_real=use_real_data)
+                               seed=seed + 2, use_real=use_real_data,
+                               img_size=img_size)
 
-    kw = dict(collate_fn=MedMNISTDataset.collate_fn, num_workers=num_workers)
+    kw = dict(collate_fn=MedMNISTDataset.collate_fn, num_workers=num_workers,
+              pin_memory=True)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,

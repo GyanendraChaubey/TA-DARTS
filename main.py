@@ -36,9 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Number of search epochs")
     g.add_argument("--batch",           type=int,   default=64,
                    help="Batch size")
-    g.add_argument("--layers",          type=int,   default=6,
+    g.add_argument("--layers",          type=int,   default=8,
                    help="Number of searchable layers")
-    g.add_argument("--channels",        type=int,   default=32,
+    g.add_argument("--channels",        type=int,   default=64,
                    help="Feature map channel width")
     g.add_argument("--lr_w",            type=float, default=0.025,
                    help="Weight optimiser learning rate")
@@ -65,10 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[D] Early-stop threshold on mean alpha entropy")
 
     g2 = parser.add_argument_group("Retrain Phase")
-    g2.add_argument("--retrain_epochs", type=int,   default=100,
+    g2.add_argument("--retrain_epochs", type=int,   default=200,
                     help="Epochs for discrete model retraining")
     g2.add_argument("--retrain_lr",     type=float, default=0.025,
                     help="Learning rate for retraining")
+    g2.add_argument("--mixup-alpha",    type=float, default=0.2,
+                    help="Mixup Beta distribution alpha (0 = disabled)")
+    g2.add_argument("--label-smoothing",type=float, default=0.1,
+                    help="Label smoothing for CE tasks (0 = disabled)")
 
     g3 = parser.add_argument_group("Infrastructure")
     g3.add_argument("--device",         type=str,   default="cpu",
@@ -83,6 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
     g3.add_argument("--seed",           type=int,   default=42)
     g3.add_argument("--workers",        type=int,   default=0,
                     help="DataLoader num_workers")
+    g3.add_argument("--img-size",       type=int,   default=64,
+                    help="Input resolution: 28 | 64 | 128 (64 recommended)")
 
     return parser
 
@@ -122,4 +128,7 @@ if __name__ == "__main__":
         anneal_interval   = args.anneal_interval,
         alpha_update_freq = args.alpha_freq,
         entropy_threshold = args.entropy_thresh,
+        img_size          = args.img_size,
+        mixup_alpha       = args.mixup_alpha,
+        label_smoothing   = args.label_smoothing,
     )
