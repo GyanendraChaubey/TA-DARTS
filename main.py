@@ -53,9 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Contrib. [B]
     g.add_argument("--tau_init",        type=float, default=1.5,
                    help="[B] Initial sparsemax temperature")
-    g.add_argument("--anneal_factor",   type=float, default=0.75,
+    g.add_argument("--anneal_factor",   type=float, default=0.85,
                    help="[B] Temperature annealing factor per interval")
-    g.add_argument("--anneal_interval", type=int,   default=5,
+    g.add_argument("--anneal_interval", type=int,   default=10,
                    help="[B] Epochs between temperature decay steps")
     g.add_argument("--tau_min",         type=float, default=0.1,
                    help="[B] Minimum sparsemax temperature floor (prevents collapse)")
@@ -65,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
     # Contrib. [D]
     g.add_argument("--entropy_thresh",  type=float, default=0.05,
                    help="[D] Early-stop threshold on mean alpha entropy")
+    g.add_argument("--auc_patience",    type=int,   default=10,
+                   help="[D] Stop if mean AUC does not improve for this many epochs")
+    g.add_argument("--rewind_thresh",   type=float, default=0.10,
+                   help="[D] Rewind alphas to best if mean AUC drops by this fraction")
 
     g2 = parser.add_argument_group("Retrain Phase")
     g2.add_argument("--retrain_epochs", type=int,   default=200,
@@ -131,6 +135,8 @@ if __name__ == "__main__":
         tau_min           = args.tau_min,
         alpha_update_freq = args.alpha_freq,
         entropy_threshold = args.entropy_thresh,
+        auc_patience      = args.auc_patience,
+        rewind_thresh     = args.rewind_thresh,
         img_size          = args.img_size,
         mixup_alpha       = args.mixup_alpha,
         label_smoothing   = args.label_smoothing,

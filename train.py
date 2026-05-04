@@ -54,11 +54,15 @@ def run_search(
     retrain_lr:        float = 0.025,
     # ── Contrib. [B] temperature annealing ──────────────────────────────────
     tau_init:          float = 1.5,
-    anneal_factor:     float = 0.75,
-    anneal_interval:   int   = 5,    tau_min:           float = 0.1,    # ── Contrib. [C] delayed alpha updates ──────────────────────────────────
+    anneal_factor:     float = 0.85,
+    anneal_interval:   int   = 10,
+    tau_min:           float = 0.1,
+    # ── Contrib. [C] delayed alpha updates ───────────────────────────────────
     alpha_update_freq: int   = 10,
-    # ── Contrib. [D] early stopping ─────────────────────────────────────────
+    # ── Contrib. [D] early stopping ──────────────────────────────────────────
     entropy_threshold: float = 0.05,
+    auc_patience:      int   = 10,
+    rewind_thresh:     float = 0.10,
     # ── Infrastructure ──────────────────────────────────────────────────────
     ckpt_dir:          str          = "checkpoints",
     save_dir:          str          = "./results",
@@ -155,6 +159,7 @@ def run_search(
     best_alphas         = model.alphas.detach().clone()
     best_tau            = tau_init
     best_alpha_epoch    = start_epoch
+    auc_no_improve      = 0          # patience counter
 
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
@@ -210,7 +215,7 @@ def run_search(
             )
         controller.save_checkpoint(epoch, ckpt_dir=ckpt_dir, tag="latest")
 
-        # Track best alpha state at peak mean AUC
+        # Track best alpha state at peak mean AUC + rewind + patience
         if eval_results is not None:
             mean_auc = sum(
                 eval_results[k].get("auc", 0.0) for k in eval_results
@@ -220,10 +225,31 @@ def run_search(
                 best_alphas        = model.alphas.detach().clone()
                 best_tau           = controller._current_tau
                 best_alpha_epoch   = epoch
+                auc_no_improve     = 0
                 logger.info(
                     f"  [best-α] Saved alpha snapshot at epoch {epoch}"
                     f"  mean_auc={best_mean_auc:.4f}  τ={best_tau:.4f}"
                 )
+            else:
+                auc_no_improve += 1
+                # Rewind: if AUC dropped >rewind_thresh fraction, restore alphas
+                if best_mean_auc > 0 and mean_auc < best_mean_auc * (1.0 - rewind_thresh):
+                    with torch.no_grad():
+                        model.alphas.copy_(best_alphas)
+                    logger.info(
+                        f"  [rewind] AUC dropped {(best_mean_auc - mean_auc):.4f}"
+                        f" (>{rewind_thresh*100:.0f}%) at epoch {epoch}."
+                        f" Alphas rewound to epoch {best_alpha_epoch}."
+                    )
+                # Patience-based early stop
+                if auc_no_improve >= auc_patience:
+                    logger.info(
+                        f"  ▶ Early stopping: mean AUC did not improve for"
+                        f" {auc_patience} epochs (best={best_mean_auc:.4f}"
+                        f" at epoch {best_alpha_epoch})."
+                    )
+                    early_stopped_epoch = epoch
+                    break
 
         # Contrib. [D] — early stopping on alpha convergence
         ent = alpha_entropy(model, controller._current_tau)
