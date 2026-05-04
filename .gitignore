@@ -14,3 +14,10 @@ results/*.pt
 .DS_Store
 checkpoints/
 results/*.pt
+
+#folders
+tests/
+test/
+results1/
+results/
+

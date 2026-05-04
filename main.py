@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[B] Temperature annealing factor per interval")
     g.add_argument("--anneal_interval", type=int,   default=5,
                    help="[B] Epochs between temperature decay steps")
+    g.add_argument("--tau_min",         type=float, default=0.1,
+                   help="[B] Minimum sparsemax temperature floor (prevents collapse)")
     # Contrib. [C]
     g.add_argument("--alpha_freq",      type=int,   default=10,
                    help="[C] Update alpha every N weight steps")
@@ -126,6 +128,7 @@ if __name__ == "__main__":
         tau_init          = args.tau_init,
         anneal_factor     = args.anneal_factor,
         anneal_interval   = args.anneal_interval,
+        tau_min           = args.tau_min,
         alpha_update_freq = args.alpha_freq,
         entropy_threshold = args.entropy_thresh,
         img_size          = args.img_size,

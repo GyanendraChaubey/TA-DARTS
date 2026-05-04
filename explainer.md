@@ -138,7 +138,7 @@ The whole training run has four phases, done in order.
 
 ### Stage 1 — Search (the competition)
 
-The system runs for ~50 rounds (epochs).  In each round it sees thousands of
+The system runs for up to 50 rounds (epochs).  In each round it sees thousands of
 medical images and does two things alternately:
 
 - **Update the image-reading skill** (the machine weights) — make the network
@@ -150,13 +150,25 @@ medical images and does two things alternately:
 By the end, the vote weights converge: at each position, usually one machine
 has nearly all the votes.
 
+Throughout the search, the system silently records which set of vote weights
+gave the best average accuracy across all three tasks.  This "best snapshot"
+is what is used in Stage 2 — not the final epoch's weights, which may have
+drifted if training ran too long.
+
+There is also a temperature control on the vote weights.  Early in training
+the temperature is high, so votes are spread out and many machines contribute.
+Over time the temperature falls, making the votes sharper.  A minimum
+temperature floor prevents votes from becoming so extreme that the gradient
+signal breaks down (a failure mode called sparsemax collapse).
+
 There is a clever stopping rule: the system measures how "decided" the votes
 are.  Once the votes are decisive enough (low entropy), it stops early — no
 point running longer when the choice is already clear.
 
 ### Stage 2 — Commit (pick the winner)
 
-At each of the 8 positions, simply pick the machine that got the most votes.
+At each of the 8 positions, simply pick the machine that got the most votes
+in the best-snapshot recorded during Stage 1.
 Now we have a fixed, lean assembly line for each of the three tasks.
 
 ```
@@ -288,17 +300,24 @@ Only the final classification head is task-specific, because what
 Smoke test (fast, fake data, checks nothing crashes):
 
     python main.py --no-real --epochs 2 --batch 32 --device cpu \
-                   --img-size 64 --channels 32 --layers 4 --retrain_epochs 3
+                   --img-size 64 --channels 32 --layers 4 --retrain_epochs 3 \
+                   --tau_min 0.25
 
-Full run on a GPU (this is what you'd run on Kaggle):
+Recommended run on a GPU (Kaggle, stable 20-epoch search):
 
-    python main.py --epochs 60 --batch 128 --device cuda \
-                   --channels 64 --layers 8 --img-size 64 \
-                   --retrain_epochs 200 \
-                   --mixup-alpha 0.2 --label-smoothing 0.1 \
-                   --save-dir /kaggle/working/results \
-                   --ckpt-dir /kaggle/working/checkpoints \
-                   --workers 4
+    python main.py \
+      --epochs 20 \
+      --retrain_epochs 200 \
+      --img-size 64 \
+      --anneal_factor 0.85 \
+      --anneal_interval 5 \
+      --tau_min 0.25 \
+      --batch 128 \
+      --device cuda \
+      --seed 42 \
+      --save-dir /kaggle/working/results \
+      --ckpt-dir /kaggle/working/checkpoints \
+      --workers 4
 
 Results appear in:
 - results/benchmark_table.txt  (human-readable)

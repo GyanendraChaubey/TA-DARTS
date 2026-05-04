@@ -57,6 +57,7 @@ class SearchController:
         tau_init:          float = 1.5,
         anneal_factor:     float = 0.75,
         anneal_interval:   int   = 5,
+        tau_min:           float = 0.1,
         alpha_update_freq: int   = 10,
         label_smoothing:   float = 0.0,
     ) -> None:
@@ -69,6 +70,7 @@ class SearchController:
         self.tau_init          = tau_init
         self.anneal_factor     = anneal_factor
         self.anneal_interval   = anneal_interval
+        self.tau_min           = tau_min
         self._current_tau: float = tau_init
 
         # Contrib. [C] — delayed alpha updates
@@ -187,7 +189,7 @@ class SearchController:
         self.scheduler.step()
         self._current_tau = max(
             self.tau_init * (self.anneal_factor ** (epoch // self.anneal_interval)),
-            1e-2,
+            self.tau_min,
         )
         logger.info(
             f"  LR → {self.scheduler.get_last_lr()[0]:.6f}"

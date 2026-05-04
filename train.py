@@ -55,8 +55,7 @@ def run_search(
     # ── Contrib. [B] temperature annealing ──────────────────────────────────
     tau_init:          float = 1.5,
     anneal_factor:     float = 0.75,
-    anneal_interval:   int   = 5,
-    # ── Contrib. [C] delayed alpha updates ──────────────────────────────────
+    anneal_interval:   int   = 5,    tau_min:           float = 0.1,    # ── Contrib. [C] delayed alpha updates ──────────────────────────────────
     alpha_update_freq: int   = 10,
     # ── Contrib. [D] early stopping ─────────────────────────────────────────
     entropy_threshold: float = 0.05,
@@ -116,6 +115,7 @@ def run_search(
         tau_init=tau_init,
         anneal_factor=anneal_factor,
         anneal_interval=anneal_interval,
+        tau_min=tau_min,
         alpha_update_freq=alpha_update_freq,
         label_smoothing=label_smoothing,
     )
@@ -151,6 +151,10 @@ def run_search(
     search_start        = time.time()
     val_iter            = iter(val_loader_bilevel)
     early_stopped_epoch = num_epochs
+    best_mean_auc       = -1.0
+    best_alphas         = model.alphas.detach().clone()
+    best_tau            = tau_init
+    best_alpha_epoch    = start_epoch
 
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
@@ -206,6 +210,21 @@ def run_search(
             )
         controller.save_checkpoint(epoch, ckpt_dir=ckpt_dir, tag="latest")
 
+        # Track best alpha state at peak mean AUC
+        if eval_results is not None:
+            mean_auc = sum(
+                eval_results[k].get("auc", 0.0) for k in eval_results
+            ) / max(len(eval_results), 1)
+            if mean_auc > best_mean_auc:
+                best_mean_auc      = mean_auc
+                best_alphas        = model.alphas.detach().clone()
+                best_tau           = controller._current_tau
+                best_alpha_epoch   = epoch
+                logger.info(
+                    f"  [best-α] Saved alpha snapshot at epoch {epoch}"
+                    f"  mean_auc={best_mean_auc:.4f}  τ={best_tau:.4f}"
+                )
+
         # Contrib. [D] — early stopping on alpha convergence
         ent = alpha_entropy(model, controller._current_tau)
         logger.info(
@@ -240,14 +259,19 @@ def run_search(
     )
     controller.log_arch_distribution()
 
+    logger.info(
+        f"  Using alpha snapshot from epoch {best_alpha_epoch}"
+        f" (mean AUC={best_mean_auc:.4f}) for discretization."
+    )
+
     # ── Save per-task architecture snapshot to file (Fix 6) ───────────────────
     arch_snapshot_path = os.path.join(save_dir, "architecture_snapshot.txt")
     with open(arch_snapshot_path, "w") as f:
         from src.normalizers import annealed_sparsemax as _sp
-        _soft = _sp(model.alphas, tau=controller._current_tau)
+        _soft = _sp(best_alphas, tau=best_tau)
         for t in range(model.num_tasks):
             tname = MedMNISTDataset.TASK_NAMES.get(t, f"Task{t}")
-            best  = model.alphas[t].argmax(dim=-1).tolist()
+            best  = best_alphas[t].argmax(dim=-1).tolist()
             arch  = [OP_NAMES[i] for i in best]
             f.write(f"{tname}: {arch}\n")
             for lay in range(model.num_layers):
@@ -267,9 +291,13 @@ def run_search(
     discrete_models: Dict[int, torch.nn.Module] = {}
     architectures:   Dict[int, List[str]]       = {}
 
+    # Restore best alphas into the model before discretization
+    with torch.no_grad():
+        model.alphas.copy_(best_alphas)
+
     for k in range(model.num_tasks):
         discrete_models[k] = model.discretize(k)
-        best_indices        = model.alphas[k].argmax(dim=-1).tolist()
+        best_indices        = best_alphas[k].argmax(dim=-1).tolist()
         architectures[k]   = [OP_NAMES[i] for i in best_indices]
 
     # ══════════════════════════════════════════════════════════════════════════

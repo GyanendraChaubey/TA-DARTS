@@ -1,562 +1,723 @@
-# MT-DARTS v2 Architecture (Conference-Ready Technical Note)
+# MT-DARTS v2 — Architecture Reference
 
-## 1. Scope and Positioning
+## 1. Scope
 
-This document specifies the architecture, optimization pipeline, and experimental protocol of MT-DARTS v2 for multi-task neural architecture search (NAS) on MedMNIST.
-
-Target use: method section and supplementary material for top-tier venues (CVPR/NeurIPS/AAAI) with emphasis on:
-- clear problem formulation,
-- implementation-faithful design description,
-- reproducibility and ablation readiness,
-- explicit mapping between equations and source code.
+This document describes the architecture, optimization pipeline, and
+experimental protocol of MT-DARTS v2.  Every section maps directly to
+source files.
 
 Codebase entry points:
-- [main.py](main.py)
-- [train.py](train.py)
-- [src/supernet.py](src/supernet.py)
-- [src/controller.py](src/controller.py)
-- [src/data.py](src/data.py)
-- [src/retrain.py](src/retrain.py)
+- main.py
+- train.py
+- src/supernet.py
+- src/controller.py
+- src/data.py
+- src/retrain.py
 
 ---
 
 ## 2. Problem Setup
 
-We search task-specific architectures jointly for three medical image tasks:
-- Task 0: PathMNIST (single-label, 9 classes)
-- Task 1: ChestMNIST (multi-label, 14 classes)
-- Task 2: DermaMNIST (single-label, 7 classes)
+Three medical image classification tasks run jointly:
 
-A shared supernet provides feature extraction, while each task has:
-- its own classification head,
-- its own architecture parameters over operation choices at each searchable layer.
+    Task 0 - PathMNIST    single-label   9 classes
+    Task 1 - ChestMNIST   multi-label   14 classes
+    Task 2 - DermaMNIST   single-label   7 classes
 
-Goal:
-learn high-performing, compact per-task discrete architectures with a single differentiable search pass, then retrain each selected architecture from scratch.
+A shared supernet provides feature extraction.  Each task owns:
+- an independent classification head,
+- an independent architecture parameter tensor alpha_t over L layers.
 
----
-
-## 3. High-Level System Architecture
-
-Pipeline stages (implemented in [train.py](train.py)):
-1. Phase A - Bilevel architecture search on supernet.
-2. Phase B - Discretize each task architecture via argmax over searched operation logits.
-3. Phase C - Retrain each discrete model from random initialization.
-4. Phase D - Evaluate and report benchmark metrics.
-
-Conceptual forward graph:
-
-Input (B,3,28,28)
--> shared stem
--> L searchable cells (MixedOp)
--> task-specific head k
--> task-specific loss
-
-Where each MixedOp is a weighted sum over candidate primitives.
+Goal: learn per-task discrete architectures in one differentiable search
+pass, then retrain each selected architecture from scratch.
 
 ---
 
-## 4. Search Space and Supernet Design
+## 3. Four-Phase Pipeline  (train.py :: run_search)
 
-### 4.1 Candidate operations per searchable layer
-
-Defined in [src/ops.py](src/ops.py):
-- MBConv3x3
-- MBConv5x5
-- DilatedConv3x3
-- SkipConnect
-- Zero
-
-Let the number of operations be $O=5$ and layers be $L$.
-
-### 4.2 Supernet parameterization
-
-The supernet in [src/supernet.py](src/supernet.py) contains:
-- shared stem,
-- $L$ MixedOp cells,
-- one task head per task,
-- architecture logits $\alpha \in \mathbb{R}^{T \times L \times O}$.
-
-For task $t$, layer $\ell$, the normalized op weights are:
-
-$$
-\pi_{t,\ell} = \operatorname{Sparsemax}\!\left(\frac{\alpha_{t,\ell}}{\tau}\right),
-$$
-
-with temperature $\tau$ annealed during search.
-
-Layer output:
-
-$$
-\mathbf{h}_{\ell+1} = \sum_{o=1}^{O} \pi_{t,\ell,o} \cdot o(\mathbf{h}_{\ell}).
-$$
-
-Key property:
-architecture parameters are task-indexed; gradients of task $t$ losses update only $\alpha_t$, enabling task-level architecture disentanglement.
-
----
-
-## 5. Data and Task Routing
-
-Implemented in [src/data.py](src/data.py):
-- unified dataset merging PathMNIST, ChestMNIST, DermaMNIST,
-- mixed-task mini-batches with task IDs,
-- custom collation for heterogeneous labels,
-- real MedMNIST loading with synthetic fallback.
-
-Label formats:
-- single-label tasks: scalar class index,
-- multi-label ChestMNIST: multi-hot vector of size 14.
-
-Loss dispatch in [src/losses.py](src/losses.py):
-- CrossEntropy for single-label tasks,
-- BCEWithLogits for ChestMNIST.
-
----
-
-## 6. Optimization: Bilevel Search Controller
-
-Implemented in [src/controller.py](src/controller.py).
-
-At each step, the controller performs:
-1. Weight update on training batch (architecture frozen).
-2. Architecture update on validation batch every $f$ steps (delayed alpha updates).
-
-Formally:
-
-$$
-\mathbf{w} \leftarrow \mathbf{w} - \eta_w \nabla_{\mathbf{w}} \mathcal{L}_{train}(\mathbf{w},\alpha)
-$$
-
-$$
-\alpha \leftarrow \alpha - \eta_{\alpha} \nabla_{\alpha} \mathcal{L}_{val}(\mathbf{w},\alpha), \quad \text{only if step} \bmod f = 0.
-$$
-
-Learning-rate schedule:
-- SGD with cosine annealing for network weights.
-
-Temperature schedule:
-
-$$
-\tau_e = \max\left(\tau_0 \cdot a^{\lfloor e/m \rfloor},\; 10^{-2}\right),
-$$
-
-where:
-- $\tau_0$: initial temperature,
-- $a$: anneal factor,
-- $m$: anneal interval in epochs,
-- $e$: current epoch.
-
-### Early stopping criterion
-
-Entropy-based convergence in [src/metrics.py](src/metrics.py):
-
-$$
-H = -\frac{1}{TL}\sum_{t=1}^{T}\sum_{\ell=1}^{L}\sum_{o=1}^{O}
-\pi_{t,\ell,o}\log\pi_{t,\ell,o}.
-$$
-
-Search stops early if $H < \epsilon$ (configurable entropy threshold).
-
----
-
-## 7. Discretization and Retraining Protocol
-
-### 7.1 Discretization
-
-For each task $t$, choose operation index:
-
-$$
-\hat{o}_{t,\ell} = \arg\max_{o} \alpha_{t,\ell,o}
-$$
-
-and instantiate a discrete sequential model (see [src/supernet.py](src/supernet.py)).
-
-### 7.2 Retraining
-
-Implemented in [src/retrain.py](src/retrain.py):
-- reinitialize all weights,
-- train with SGD + cosine annealing,
-- keep best checkpoint by validation AUC,
-- report test ACC/AUC/loss.
-
-This follows standard DARTS evaluation convention: search and retrain are separated.
-
----
-
-## 8. Metrics and Reporting
-
-Evaluation logic in [src/metrics.py](src/metrics.py):
-- per-task ACC,
-- per-task AUC (with multi-label-safe handling and graceful fallback when AUC is undefined),
-- per-task loss.
-
-Final artifacts from [src/reporting.py](src/reporting.py):
-- ASCII benchmark table,
-- JSON summary including per-task architecture and macro averages.
-
----
-
-## 9. Code-to-Method Mapping (for Paper Writing)
-
-Use this mapping to keep manuscript claims implementation-faithful:
-
-- Method overview and CLI hyperparameters:
-  [main.py](main.py)
-- End-to-end experimental protocol (Phases A-D):
-  [train.py](train.py)
-- Supernet and task-specific architecture parameters:
-  [src/supernet.py](src/supernet.py)
-- Bilevel optimization, delayed alpha updates, temperature annealing:
-  [src/controller.py](src/controller.py)
-- Sparsemax and annealed sparsemax equations:
-  [src/normalizers.py](src/normalizers.py)
-- Search space primitives and MixedOp composition:
-  [src/ops.py](src/ops.py)
-- Data unification and task-aware label handling:
-  [src/data.py](src/data.py)
-- Task-aware losses:
-  [src/losses.py](src/losses.py)
-- Evaluation metrics and entropy stopping:
-  [src/metrics.py](src/metrics.py)
-- Retrain-from-scratch protocol:
-  [src/retrain.py](src/retrain.py)
-
----
-
-## 10. Reproducibility Checklist (Top-Tier Ready)
-
-For CVPR/NeurIPS/AAAI quality, include all items below in experiments:
-
-1. Determinism and seeds
-- Report all seeds.
-- Keep code-level seed setting enabled.
-- Document nondeterministic ops if any backend uses them.
-
-2. Data protocol
-- Report exact split sizes for train/val/test for each MedMNIST task.
-- State preprocessing and normalization constants.
-- Clarify whether downloaded cached files or online loading were used.
-
-3. Compute budget
-- Report device type (CPU/CUDA/MPS), memory, and wall-clock search/retrain time.
-- Report trainable parameter counts for supernet and discrete models.
-
-4. Hyperparameters
-- Publish full search and retrain hyperparameter tables:
-  learning rates, batch size, layers, channels, tau schedule, alpha update frequency, entropy threshold.
-
-5. Statistical reliability
-- Run multiple seeds (recommended 3 to 5).
-- Report mean and standard deviation for AUC/ACC.
-
-6. Fair comparison
-- Keep identical data splits and evaluation metrics across baselines.
-- Match or report parameter/FLOP budgets where possible.
-
-7. Artifacts
-- Save checkpoints and benchmark JSON outputs.
-- Version-control environment and dependency versions.
-
----
-
-## 11. Recommended Ablations for Strong Submission
-
-Minimum ablations to justify novelty:
-
-1. Sparsemax vs softmax in architecture weighting.
-2. Temperature annealing on/off and different anneal factors.
-3. Delayed alpha updates frequency sweep (e.g., 1, 5, 10, 20).
-4. Entropy-based early stopping on/off and threshold sweep.
-5. Search-space ablation (remove Zero, remove DilatedConv, etc.).
-6. Shared vs task-specific architecture parameters.
-
-Report both performance and efficiency (search time, retrain time, params).
-
----
-
-## 12. Known Implementation Notes
-
-1. Mixed-task data loader is used throughout the pipeline with task-aware filtering during evaluation and bilevel losses.
-2. ChestMNIST images may be loaded as grayscale tensors and are converted to 3 channels in [src/data.py](src/data.py), ensuring a consistent 3-channel input interface.
-3. AUC can be undefined in degenerate class-presence scenarios; the implementation handles this safely.
-
----
-
-## 13. Suggested Paper Paragraph (Drop-in Draft)
-
-"We propose MT-DARTS v2, a task-aware differentiable NAS framework for multi-task MedMNIST classification. The method uses a shared supernet with task-specific architecture logits over a five-operator search space (MBConv3x3, MBConv5x5, DilatedConv3x3, SkipConnect, Zero). Architecture weights are computed via annealed sparsemax, yielding sparse and progressively sharper operator distributions. We optimize network weights and architecture parameters in a bilevel loop, with delayed architecture updates to stabilize search. Convergence is monitored through mean architecture entropy, enabling principled early stopping. After search, each task architecture is discretized by argmax selection and retrained from scratch under a standardized protocol, reporting ACC and AUC per task and macro averages."
-
----
-
-## 14. HLD Diagram (System View)
-
-```mermaid
-flowchart TD
-  A[CLI and Config<br/>main.py] --> B[Orchestrator<br/>train.run_search]
-
-  B --> C[Data Pipeline<br/>src/data.py]
-  C --> C1[Train Loader]
-  C --> C2[Val Loader for Bilevel Alpha]
-  C --> C3[Test Loader for Eval]
-
-  B --> D[Task-Aware Supernet<br/>src/supernet.py]
-  D --> D1[Shared Stem]
-  D --> D2[L MixedOp Cells]
-  D --> D3[Task Heads x 3]
-  D --> D4[Architecture Logits alpha: T x L x O]
-
-  B --> E[Search Controller<br/>src/controller.py]
-  E --> E1[Weight Optimizer SGD + Cosine]
-  E --> E2[Alpha Optimizer Adam]
-  E --> E3[Tau Annealing + Delayed Alpha Updates]
-
-  E --> F[Phase A: Bilevel Search]
-  F --> G[Phase B: Discretize per Task]
-  G --> H[Phase C: Retrain Discrete Models<br/>src/retrain.py]
-  H --> I[Phase D: Evaluate + Report]
-
-  I --> I1[Metrics ACC/AUC/Loss<br/>src/metrics.py]
-  I --> I2[Benchmark Table + JSON<br/>src/reporting.py]
-
-  J[Results Artifacts<br/>checkpoints and results] --> K[Paper Tables/Figures]
-  I2 --> J
 ```
-
-### HLD Notes
-
-1. The framework separates search-time supernet optimization from final retraining for fair NAS evaluation.
-2. Search uses mixed-task batches with task-aware loss routing and evaluation.
-3. Reporting emits publication-ready metrics and architecture summaries.
-
----
-
-## 15. LLD Diagram (Module and Call Flow)
-
-```mermaid
-flowchart LR
-  subgraph Entry
-    M1[main.py]
-    M2[train.py::run_search]
-    M1 --> M2
-  end
-
-  subgraph Data_Layer
-    D1[src/data.py::build_dataloaders]
-    D2[src/data.py::MedMNISTDataset]
-    D1 --> D2
-  end
-
-  subgraph Model_Layer
-    S1[src/supernet.py::TaskAwareSupernet]
-    O1[src/ops.py::MixedOp and primitives]
-    N1[src/normalizers.py::annealed_sparsemax]
-    S1 --> O1
-    S1 --> N1
-  end
-
-  subgraph Search_Layer
-    C1[src/controller.py::SearchController]
-    L1[src/losses.py::task_loss]
-    ME1[src/metrics.py::alpha_entropy]
-    C1 --> L1
-    C1 --> ME1
-  end
-
-  subgraph Eval_Layer
-    ME2[src/metrics.py::evaluate and evaluate_task]
-    R1[src/retrain.py::retrain_discrete]
-    RP1[src/reporting.py::print and save]
-  end
-
-  M2 --> D1
-  M2 --> S1
-  M2 --> C1
-
-  D1 --> C1
-  C1 --> S1
-
-  C1 -->|end search| S1
-  S1 -->|discretize task k| R1
-  D1 --> R1
-  R1 --> ME2
-  M2 --> ME2
-  M2 --> RP1
-
-  RP1 --> OUT[results/benchmark_results.json and benchmark_table.txt]
-```
-
-### LLD Notes
-
-1. `run_search` is the sole orchestration point that wires all modules.
-2. `SearchController.step` performs bilevel updates with train/val split usage.
-3. `TaskAwareSupernet.discretize` creates task-specific discrete graphs for retraining.
-4. `retrain_discrete` reinitializes and trains each task model independently before final reporting.
-
----
-
-## 16. Sequence Diagram (Training-Time Runtime)
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant U as User
-  participant CLI as main.py
-  participant OR as train.run_search
-  participant DL as build_dataloaders
-  participant SN as TaskAwareSupernet
-  participant SC as SearchController
-  participant MT as metrics
-  participant RT as retrain_discrete
-  participant RP as reporting
-
-  U->>CLI: Launch experiment with args
-  CLI->>OR: run_search(config)
-  OR->>DL: create train, val, test loaders
-  OR->>SN: instantiate supernet
-  OR->>SC: initialize controller
-
-  loop Epoch 1..E
-    loop Each train batch
-      OR->>SC: step(train_batch, val_batch)
-      SC->>SN: forward for each present task
-      SC->>SC: update weights each step
-      alt step mod alpha_freq == 0
-        SC->>SC: update alphas on val batch
-      end
-    end
-    OR->>SC: step_scheduler(epoch)
-    OR->>MT: evaluate(supernet)
-    OR->>MT: alpha_entropy(supernet)
-  end
-
-  OR->>SN: discretize(task 0..2)
-  loop Task 0..2
-    OR->>RT: retrain_discrete(model_k)
-    RT->>MT: evaluate_task(val/test)
-  end
-
-  OR->>RP: print and save benchmark outputs
-  RP-->>U: JSON and table artifacts
++------------------------------------------------------------------+
+|  Phase A   Bilevel architecture search on the supernet           |
+|            Best alpha weights tracked throughout by mean AUC     |
++------------------------------------------------------------------+
+|  Phase B   Restore best-AUC alphas; discretize per-task arch     |
++------------------------------------------------------------------+
+|  Phase C   Retrain each discrete model from random init          |
++------------------------------------------------------------------+
+|  Phase D   Evaluate and emit benchmark report                    |
++------------------------------------------------------------------+
 ```
 
 ---
 
-## 17. Camera-Ready Diagram Pack (CVPR Style)
+## 4. Search Space  (src/ops.py)
 
-Use this section when preparing a visually compact CVPR-style method figure set.
-The flow prioritizes clarity of training phases and module ownership.
+Seven candidate operations, O = 7:
 
-### Figure 1 (CVPR): End-to-End MT-DARTS Pipeline
-
-```mermaid
-flowchart TB
-  IN[MedMNIST Splits<br/>Train | Val | Test] --> DP[Task-Aware Data Pipeline<br/>src/data.py]
-  DP --> SRCH[Phase A: Bilevel Search<br/>src/controller.py]
-  SRCH --> DISC[Phase B: Discretization<br/>src/supernet.py]
-  DISC --> RTRN[Phase C: Retrain from Scratch<br/>src/retrain.py]
-  RTRN --> EVAL[Phase D: Evaluation + Reporting<br/>src/metrics.py and src/reporting.py]
-  EVAL --> OUT[Artifacts<br/>benchmark_results.json | benchmark_table.txt | checkpoints]
-
-  SN[Task-Aware Supernet<br/>shared stem + L MixedOp + 3 heads] --> SRCH
-  OPS[Search Space<br/>MBConv3x3 | MBConv5x5 | DilatedConv3x3 | SkipConnect | Zero] --> SN
-  CTRL[Key Search Mechanics<br/>annealed sparsemax, delayed alpha updates, entropy stopping] --> SRCH
+```
++---+----------------+---------------------------------------------+
+| # | Name           | Description                                 |
++---+----------------+---------------------------------------------+
+| 0 | MBConv3x3      | Inverted-residual, 3x3 dw, expansion 4      |
+| 1 | MBConv5x5      | Inverted-residual, 5x5 dw, expansion 6      |
+| 2 | MBConvSE       | MBConv3x3 + Squeeze-and-Excitation (r=4)    |
+| 3 | DilatedConv3x3 | Dilated depthwise 3x3 (dilation=2) + pw 1x1 |
+| 4 | SepConv5x5     | Depthwise-sep 5x5 + residual                |
+| 5 | SkipConnect    | Identity (residual pass-through)            |
+| 6 | Zero           | Zero tensor (drops the layer)               |
++---+----------------+---------------------------------------------+
 ```
 
-Suggested CVPR caption:
-Figure 1. Overall MT-DARTS v2 pipeline. The method performs bilevel supernet search, per-task architecture discretization, and retraining from scratch before final benchmark reporting. The search combines annealed sparsemax, delayed architecture updates, and entropy-based convergence.
+SEBlock inside MBConvSE:
+  global-avg-pool -> Linear(C, C//4) -> ReLU -> Linear(C//4, C) -> Sigmoid
+  -> channel-wise multiply.
 
-### Figure 2 (CVPR): Supernet Internal Dataflow
+MixedOp (during search):
 
-```mermaid
-flowchart LR
-  X[Input x: B x 3 x 28 x 28] --> STEM[Shared Stem]
-  STEM --> C0[MixedOp layer 1]
-  C0 --> C1[MixedOp layer 2]
-  C1 --> C2[...]
-  C2 --> CL[MixedOp layer L]
+    h_out = sum_{o=1}^{7}  pi_{t,l,o} * op_o(h_in)
 
-  A[Task-specific alpha_t: L x O] --> NORM[annealed sparsemax(alpha_t / tau)]
-  NORM --> W[Layer-wise op weights]
-  W --> C0
-  W --> C1
-  W --> CL
-
-  CL --> H0[Head task 0: PathMNIST]
-  CL --> H1[Head task 1: ChestMNIST]
-  CL --> H2[Head task 2: DermaMNIST]
-
-  H0 --> Y0[Logits 9]
-  H1 --> Y1[Logits 14]
-  H2 --> Y2[Logits 7]
-```
-
-Suggested CVPR caption:
-Figure 2. Task-aware supernet with shared features and task-specific architecture distributions. For task t, operation mixtures are computed from alpha_t and temperature tau through sparsemax, yielding sparse layer-level operator selection during search.
+where pi is computed by annealed sparsemax (see Section 6).
 
 ---
 
-## 18. Camera-Ready Diagram Pack (NeurIPS Style)
+## 5. Supernet Design  (src/supernet.py)
 
-Use this section for equation-first NeurIPS framing, emphasizing optimization states and parameter updates.
+### 5.1 Adaptive input stem
 
-### Figure 1 (NeurIPS): Bilevel Optimization Graph
+```
+img_size > 32  (default: 64x64 input)
+  +------------------------------------------+
+  | Conv2d(3, C/2, 3x3, stride=2, pad=1)    |
+  | BatchNorm2d  +  ReLU6                    |
+  | Conv2d(C/2, C, 3x3, stride=2, pad=1)    |
+  | BatchNorm2d  +  ReLU6                    |
+  +------------------------------------------+
+  Output: (B, C, H/4, W/4)   -- e.g. 64x64 -> 16x16
 
-```mermaid
-flowchart TD
-  TBatch[Train batch] --> LW[Weight loss L_train(w, alpha)]
-  VBatch[Validation batch] --> LA[Arch loss L_val(w, alpha)]
-
-  LW --> UW[w update: SGD + cosine]
-  LA --> UA[alpha update: Adam every alpha_freq steps]
-
-  UW --> W[w_{k+1}]
-  UA --> A[alpha_{k+1}]
-
-  A --> TAU[pi = sparsemax(alpha / tau)]
-  TAU --> LW
-  TAU --> LA
-
-  EPOCH[Epoch boundary] --> SCH[tau schedule: tau_e = max(tau_0 * a^(floor(e/m)), 1e-2)]
-  SCH --> TAU
-
-  A --> ENT[Entropy H(pi)]
-  ENT --> STOP{H < epsilon ?}
-  STOP -->|yes| CONV[Stop search]
-  STOP -->|no| TBatch
+img_size <= 32  (28x28 smoke test mode)
+  +------------------------------------------+
+  | Conv2d(3, C, 3x3, stride=1, pad=1)      |
+  | BatchNorm2d  +  ReLU6                    |
+  +------------------------------------------+
+  Output: (B, C, H, W)
 ```
 
-Suggested NeurIPS caption:
-Figure 1. Bilevel optimization in MT-DARTS v2. Network weights are updated on training batches, while architecture parameters are updated on validation batches at a delayed frequency. Sparsemax temperature is annealed by epoch, and optimization stops early when architecture entropy indicates convergence.
+Default C = 64 channels.
 
-### Figure 2 (NeurIPS): Module-Level Dependency Graph
+### 5.2 Searchable body
 
-```mermaid
-flowchart LR
-  M[main.py] --> R[train.py::run_search]
+L MixedOp cells in sequence (default L = 8):
 
-  R --> D[src/data.py]
-  R --> S[src/supernet.py]
-  R --> C[src/controller.py]
-  R --> ME[src/metrics.py]
-  R --> RT[src/retrain.py]
-  R --> RP[src/reporting.py]
-
-  C --> L[src/losses.py]
-  C --> N[src/normalizers.py]
-  S --> O[src/ops.py]
-  S --> N
-  RT --> L
-  RT --> ME
-
-  RP --> RES[results/*]
+```
+  stem_out
+     |
+     v
+  +----------+    +----------+    +----------+    +----------+
+  | MixedOp  |--->| MixedOp  |--->|   ...    |--->| MixedOp  |
+  |  cell 0  |    |  cell 1  |    |          |    | cell L-1 |
+  +----------+    +----------+    +----------+    +----------+
+      ^                ^                               ^
+      |                |                               |
+  alpha_t[0]       alpha_t[1]                    alpha_t[L-1]
+  (task-specific weights per layer, shape (7,) after sparsemax)
 ```
 
-Suggested NeurIPS caption:
-Figure 2. Implementation-level dependency structure. The orchestration entry point run_search composes data loading, supernet search, discretization, retraining, and reporting. Auxiliary modules provide operation primitives, normalization, loss routing, and metric evaluation.
+### 5.3 Task-specific classification heads
 
-### Figure Placement Guidance
+After AdaptiveAvgPool2d(1) + Flatten  ->  (B, C):
 
-1. Main paper: include one overall pipeline figure and one optimization figure.
-2. Supplementary: include module dependency and runtime sequence diagrams.
-3. Keep notation synchronized with Section 4 through Section 7 above (w, alpha, tau, H).
+```
+  +--------------------------------------------------------------+
+  | Dropout(p=0.3)                                               |
+  | Linear(C, max(4*C, 256))                                     |
+  | ReLU                                                         |
+  | Dropout(p=0.2)                                               |
+  | Linear(max(4*C, 256), nc_k)                                  |
+  +--------------------------------------------------------------+
+
+  nc_0 = 9   PathMNIST
+  nc_1 = 14  ChestMNIST
+  nc_2 = 7   DermaMNIST
+```
+
+### 5.4 Architecture parameters
+
+```
+  alpha   shape: (T=3, L=8, O=7)
+  init:   zeros
+  optim:  Adam  (separate from network weights)
+```
+
+### 5.5 Complete forward path (single task t)
+
+```
+  Input (B, 3, 64, 64)
+         |
+         v
+  +======================+
+  |   Adaptive Stem      |
+  |  2x stride-2 conv    |
+  +======================+
+         | (B, 64, 16, 16)
+         v
+  sparsemax(alpha_t / tau)  ->  pi_t  shape (L, 7)
+         |
+  +------+------+--  ...  --+------+
+  |             |            |      |
+  v             v            v      v
+  MixedOp_0  MixedOp_1  ...  MixedOp_{L-1}
+         |
+         v  (B, 64, 16, 16)
+  AdaptiveAvgPool2d(1)  ->  Flatten  ->  (B, 64)
+         |
+  +-----------+-----------+-----------+
+  |           |           |           |
+  v           v           v           |
+  Head_0    Head_1    Head_2           |
+  (B,9)    (B,14)     (B,7)           |
+  PathMNIST ChestMNIST DermaMNIST     |
+  CE+smooth BCE        CE+smooth  <---+
+```
+
+---
+
+## 6. Bilevel Search Controller  (src/controller.py)
+
+### 6.1 Optimizers
+
+```
+  +-----------+------+-------------------------------------------+
+  | Param set | Opt  | Settings                                  |
+  +-----------+------+-------------------------------------------+
+  | weights w | SGD  | lr=0.025, momentum=0.9, wd=3e-4, nesterov|
+  |           |      | + CosineAnnealingLR(T_max=E, eta_min=1e-4)|
+  +-----------+------+-------------------------------------------+
+  | alphas a  | Adam | lr=3e-4, weight_decay=1e-3                |
+  +-----------+------+-------------------------------------------+
+```
+
+### 6.2 Per-step update rule
+
+```
+  Every step:
+  |   loss_w = task_loss( supernet(train_imgs, task, tau), labels )
+  |   w  <--  w - eta_w * grad_w( loss_w )
+
+  Every alpha_update_freq steps  (default = 10):
+  |   loss_a = task_loss( supernet(val_imgs,   task, tau), val_labels )
+  |   alpha  <--  alpha - eta_a * grad_a( loss_a )
+```
+
+### 6.3 Temperature annealing
+
+    tau_e = max( tau_0 * a ^ floor(e / m),  tau_min )
+
+    tau_0    = 1.5    --tau_init
+    a        = 0.75   --anneal_factor   (recommended: 0.85 for stable search)
+    m        = 5      --anneal_interval
+    tau_min  = 0.1    --tau_min         (floor prevents sparsemax collapse)
+
+Operation weights:
+
+    pi_{t,l} = sparsemax( alpha_{t,l} / tau_e )
+
+Sparsemax produces exact zeros; many ops are fully dropped during search.
+
+**Warning:** with anneal_factor=0.75 over 60 epochs, tau decays to ~0.047
+without the floor, causing sparsemax to behave as a hard argmax and making
+gradient flow collapse.  Keep tau_min >= 0.1 for runs longer than 30 epochs.
+For stable 20-epoch searches, tau_min=0.25 is recommended.
+
+### 6.4 Label smoothing during search
+
+task_loss() passes label_smoothing=0.1 to CrossEntropyLoss for tasks 0 and 2.
+ChestMNIST (task 1, BCEWithLogitsLoss) is unaffected.
+
+### 6.5 Entropy-based early stopping
+
+    H = -(1 / T*L) * sum_{t,l,o}  pi_{t,l,o} * log(pi_{t,l,o})
+
+Search halts early when H < 0.05  (--entropy_thresh).
+
+---
+
+## 7. Data Pipeline  (src/data.py)
+
+### 7.1 Dataset
+
+MedMNISTDataset: unified mixed-task dataset.
+Each sample: (image tensor, label, task_id).
+
+Image source:
+- Real  : medmnist API, size=img_size, as_rgb=True, split={train,val,test}.
+- Mock  : torch.rand(3, img_size, img_size)  -- used with --no-real flag.
+
+### 7.2 Training transforms
+
+```
+  +----------------------------------------------------+
+  | Resize((img_size, img_size))  if img_size != 28    |
+  | RandomHorizontalFlip()                             |
+  | RandomVerticalFlip()                               |
+  | ColorJitter(b=0.3, c=0.3, s=0.2, h=0.05)          |
+  | ConvertImageDtype(uint8)    -- required by RandAug |
+  | RandAugment(num_ops=2, magnitude=9)                |
+  | ConvertImageDtype(float32)                         |
+  | RandomErasing(p=0.2, scale=(0.02, 0.10))           |
+  | Normalize(task_mean, task_std)                     |
+  +----------------------------------------------------+
+```
+
+Eval transforms: Resize (if needed) + Normalize only.
+
+### 7.3 Label formats
+
+```
+  +------------+--------+------+------------------------------+
+  | Task       | id     | Type | Shape / Range                |
+  +------------+--------+------+------------------------------+
+  | PathMNIST  | 0      | long | scalar, [0, 8]               |
+  | ChestMNIST | 1      | float| tensor (14,), multi-hot      |
+  | DermaMNIST | 2      | long | scalar, [0, 6]               |
+  +------------+--------+------+------------------------------+
+```
+
+### 7.4 DataLoaders
+
+```
+  build_dataloaders() produces three loaders:
+
+  train_loader         -- shuffled, mixed-task batches
+  val_loader_bilevel   -- for alpha updates during search
+  eval_loader          -- test set, final evaluation only
+
+  Default: batch_size=64, pin_memory=True, num_workers=0
+```
+
+---
+
+## 8. Loss Routing  (src/losses.py)
+
+```
+  +---------------------------+-----------------------------------+
+  | Task                      | Loss                              |
+  +---------------------------+-----------------------------------+
+  | PathMNIST   (task_id=0)   | CrossEntropyLoss(smooth=0.1)     |
+  | ChestMNIST  (task_id=1)   | BCEWithLogitsLoss (no smoothing) |
+  | DermaMNIST  (task_id=2)   | CrossEntropyLoss(smooth=0.1)     |
+  +---------------------------+-----------------------------------+
+```
+
+---
+
+## 9. Retraining Protocol  (src/retrain.py)
+
+### 9.1 Weight reinitialization
+
+```
+  Conv2d   : kaiming_normal(fan_out, relu)
+  BN       : weight=1, bias=0  (guards against bias=None)
+  Linear   : normal(0, 0.01),  bias=0
+```
+
+### 9.2 Optimizer and LR schedule
+
+```
+  SGD  lr=0.025  momentum=0.9  wd=3e-4  nesterov=True
+
+  SequentialLR:
+  +----------------------------------------------+
+  | warmup_epochs = max(5, num_epochs // 20)     |
+  |                                              |
+  | [0 .. warmup_epochs)                         |
+  |   LinearLR: start_factor=0.1 -> 1.0          |
+  |                                              |
+  | [warmup_epochs .. num_epochs)                |
+  |   CosineAnnealingLR: eta_min=1e-5            |
+  +----------------------------------------------+
+
+  Default num_epochs = 200
+```
+
+### 9.3 Mixup augmentation  (alpha = 0.2)
+
+```
+  lam ~ Beta(0.2, 0.2),  lam = max(lam, 1-lam)   (keep dominant)
+  x_mix = lam * x_a  +  (1-lam) * x_b
+
+  CE tasks:
+    loss = lam * CE(logits, labels_a)  +  (1-lam) * CE(logits, labels_b)
+
+  BCE task (ChestMNIST):
+    label_mix = lam * label_a  +  (1-lam) * label_b
+    loss = BCE(logits, label_mix)
+```
+
+### 9.4 Checkpoint selection
+
+Val AUC is evaluated every epoch.
+Best-AUC state is restored before test evaluation.
+
+---
+
+## 10. Discretization  (src/supernet.py :: discretize)
+
+For each task t, each layer l:
+
+    op*(t, l) = argmax_o  best_alphas[t, l, o]
+
+where `best_alphas` is the alpha snapshot saved at the epoch with the
+highest mean AUC across all tasks — NOT the final epoch.  This prevents
+the discretization from being corrupted by a late-search collapse.
+
+Builds:  DiscreteModel = stem + [ op*(t,0), ..., op*(t,L-1) ] + head_t
+Passed directly to retrain_discrete().
+
+---
+
+## 11. Metrics and Reporting
+
+```
+  src/metrics.py
+  +---------------------------------------------------------+
+  | ACC   argmax comparison for single-label tasks          |
+  |       threshold=0.5 for multi-label (ChestMNIST)        |
+  | AUC   sklearn roc_auc_score; fallback to ACC on error   |
+  | Loss  mean task loss over the split                     |
+  +---------------------------------------------------------+
+
+  src/reporting.py
+  +---------------------------------------------------------+
+  | ASCII table   -> results/benchmark_table.txt            |
+  | JSON summary  -> results/benchmark_results.json         |
+  |   includes: per-task arch string, ACC, AUC, params,     |
+  |             macro averages                              |
+  +---------------------------------------------------------+
+```
+
+---
+
+## 12. Default Hyperparameters
+
+```
++---------------------+----------+----------------------------------+
+| Parameter           | Default  | CLI flag                         |
++---------------------+----------+----------------------------------+
+| Search epochs       |       50 | --epochs                         |
+| Batch size          |       64 | --batch                          |
+| Layers L            |        8 | --layers                         |
+| Channels C          |       64 | --channels                       |
+| Image size          |       64 | --img-size                       |
+| LR weights          |    0.025 | --lr_w                           |
+| LR alphas           |    3e-4  | --lr_a                           |
+| tau_init            |      1.5 | --tau_init                       |
+| anneal_factor       |     0.75 | --anneal_factor                  |
+| anneal_interval     |        5 | --anneal_interval                |
+| tau_min             |      0.1 | --tau_min  (collapse floor)      |
+| alpha_update_freq   |       10 | --alpha_freq                     |
+| entropy_threshold   |     0.05 | --entropy_thresh                 |
+| Retrain epochs      |      200 | --retrain_epochs                 |
+| Mixup alpha         |      0.2 | --mixup-alpha                    |
+| Label smoothing     |      0.1 | --label-smoothing                |
++---------------------+----------+----------------------------------+
+```
+
+Recommended settings for a stable 20-epoch search on Kaggle:
+
+```bash
+python main.py \
+  --epochs 20 \
+  --retrain_epochs 200 \
+  --img-size 64 \
+  --anneal_factor 0.85 \
+  --anneal_interval 5 \
+  --tau_min 0.25 \
+  --batch 128 \
+  --device cuda \
+  --seed 42 \
+  --save-dir /kaggle/working/results \
+  --ckpt-dir /kaggle/working/checkpoints \
+  --workers 4
+```
+
+---
+
+## 13. System Architecture Diagram
+
+```
+  +================================================================+
+  |                     MT-DARTS v2 System                         |
+  +================================================================+
+
+  [User / CLI]
+       |
+       |  python main.py <args>
+       v
+  +--------------------+
+  |      main.py       |  argparse  ->  run_search(...)
+  +--------------------+
+       |
+       v
+  +--------------------+
+  |      train.py      |  run_search()  -- 4-phase orchestrator
+  +--------------------+
+       |
+       +------------------+------------------+------------------+
+       |                  |                  |                  |
+       v                  v                  v                  v
+  +----------+     +------------+     +-----------+     +----------+
+  |  src/    |     |   src/     |     |   src/    |     |  src/    |
+  |  data.py |     | supernet   |     | controller|     | retrain  |
+  |          |     |    .py     |     |    .py    |     |   .py    |
+  | build_   |     | TaskAware  |     | Search    |     | retrain_ |
+  | data-    |     | Supernet   |     | Controller|     | discrete |
+  | loaders  |     |            |     |           |     |          |
+  +----------+     +------+-----+     +-----+-----+     +----+-----+
+       |                  |                 |                 |
+       |           +------+          +------+------+     +----+-----+
+       |           |      |          |             |     |          |
+       v           v      v          v             v     v          v
+  +--------+  +------+  +------+  +------+  +-------+ +------+ +------+
+  | mednist|  | ops  |  | norm |  | loss |  | metric| | loss | |metric|
+  |  API   |  | .py  |  | .py  |  | .py  |  |  .py  | |  .py | | .py  |
+  |        |  |      |  |      |  |      |  |       | |      | |      |
+  | 3 tasks|  | 7 ops|  |sparse|  |CE /  |  |entropy| |CE /  | |ACC / |
+  |        |  | Mixed|  | max  |  |BCE+LS|  |alpha_H| |BCE+LS| | AUC  |
+  +--------+  | Op   |  |anneal|  +------+  +-------+ +------+ +------+
+              +------+  +------+
+                                                    |
+                                                    v
+                                             +------------+
+                                             |   src/     |
+                                             | reporting  |
+                                             |    .py     |
+                                             |            |
+                                             |benchmark   |
+                                             |_table.txt  |
+                                             |_results    |
+                                             |  .json     |
+                                             +------------+
+```
+
+---
+
+## 14. Supernet Internal Dataflow
+
+```
+  Input (B, 3, 64, 64)
+         |
+         v
+  +==============================+
+  |       Adaptive Stem          |
+  |  Conv(3->32, s=2) BN ReLU6   |
+  |  Conv(32->64, s=2) BN ReLU6  |
+  +==============================+
+         | (B, 64, 16, 16)
+         |
+  alpha_t (L, 7) --sparsemax(./tau)--> pi_t (L, 7)
+         |
+         +-------------+-- ... --+-----------+
+         |             |                     |
+         v             v                     v
+    +----------+  +----------+         +----------+
+    | MixedOp  |  | MixedOp  |  . . .  | MixedOp  |
+    |  cell 0  |  |  cell 1  |         | cell L-1 |
+    |          |  |          |         |          |
+    | sum_o    |  | sum_o    |         | sum_o    |
+    | pi[0,o]  |  | pi[1,o]  |         | pi[L,o]  |
+    | * op_o   |  | * op_o   |         | * op_o   |
+    +----+-----+  +----+-----+         +----+-----+
+         |              |                   |
+         +--------------+-- ... ------------+
+                                            |
+                                            v  (B, 64, 16, 16)
+                              AdaptiveAvgPool2d(1) -> Flatten
+                                            |  (B, 64)
+                                            |
+                 +-------------+------------+-----------+
+                 |             |                        |
+                 v             v                        v
+          +----------+  +----------+            +----------+
+          | Head  t=0|  | Head  t=1|            | Head  t=2|
+          | Drop 0.3 |  | Drop 0.3 |            | Drop 0.3 |
+          | Lin->256 |  | Lin->256 |            | Lin->256 |
+          | ReLU     |  | ReLU     |            | ReLU     |
+          | Drop 0.2 |  | Drop 0.2 |            | Drop 0.2 |
+          | Lin->9   |  | Lin->14  |            | Lin->7   |
+          +----+-----+  +----+-----+            +----+-----+
+               |             |                       |
+               v             v                       v
+         Logits(B,9)   Logits(B,14)           Logits(B,7)
+         PathMNIST     ChestMNIST             DermaMNIST
+         CE+smooth     BCE                    CE+smooth
+```
+
+---
+
+## 15. Bilevel Optimization and Retraining Flow
+
+```
+  +==============================================================+
+  |                   PHASE A: Bilevel Search                    |
+  +==============================================================+
+
+  for epoch e in 1 .. E:
+  |
+  |   tau_e = max( 1.5 * 0.75^floor(e/5),  0.01 )
+  |
+  |   for (train_batch, val_batch):
+  |   |
+  |   |   ---- WEIGHT UPDATE (every step) ----------------------
+  |   |   logits = supernet(imgs, task_id, tau=tau_e)
+  |   |   loss_w = task_loss(logits, labels, label_smooth=0.1)
+  |   |   w  <--  w - eta_w * grad_w(loss_w)     [SGD + cosine]
+  |   |
+  |   |   ---- ALPHA UPDATE (every 10 steps) -------------------
+  |   |   if step % 10 == 0:
+  |   |     logits_v = supernet(val_imgs, task_id, tau=tau_e)
+  |   |     loss_a  = task_loss(logits_v, val_labels)
+  |   |     alpha  <--  alpha - eta_a * grad_a(loss_a)   [Adam]
+  |   |
+  |   +----------------------------------------------------------
+  |
+  |   ---- EARLY STOP CHECK ------------------------------------
+  |   H = mean entropy of  sparsemax(alpha / tau_e)
+  |   if H < 0.05 : break
+  |
+  +--------------------------------------------------------------
+
+  +==============================================================+
+  |                   PHASE B: Discretize                        |
+  +==============================================================+
+
+  for task t in {0, 1, 2}:
+      for layer l in 0 .. L-1:
+          op*(t,l) = argmax_o  alpha[t, l, o]
+      discrete_t = stem + [op*(t,0) .. op*(t,L-1)] + head_t
+
+  +==============================================================+
+  |                   PHASE C: Retrain                           |
+  +==============================================================+
+
+  for task t in {0, 1, 2}:
+  |
+  |   reinit_weights(discrete_t)
+  |                                          warmup  |  cosine
+  |   LR schedule:  LinearLR(0.1->1.0) -----+--------+--------->
+  |                 (max(5, 200//20) ep)     10ep      190ep
+  |
+  |   for epoch e in 1 .. 200:
+  |   |   lam ~ Beta(0.2, 0.2),  lam = max(lam, 1-lam)
+  |   |   x_mix = lam*x_a + (1-lam)*x_b
+  |   |   compute mixed loss (CE or BCE per task)
+  |   |   clip grads at 5.0
+  |   |   eval val AUC every epoch  -->  save best checkpoint
+  |   +--
+  |
+  |   restore best checkpoint
+  |   evaluate on test set -> ACC, AUC, loss
+  |
+  +--------------------------------------------------------------
+
+  +==============================================================+
+  |                   PHASE D: Report                            |
+  +==============================================================+
+
+  print ASCII table  +  write JSON  -->  results/
+```
+
+---
+
+## 16. Module Dependency Map
+
+```
+  main.py
+     |
+     +---> train.py :: run_search
+               |
+               +---> src/data.py :: build_dataloaders
+               |         |
+               |         +---> MedMNISTDataset
+               |                  (real: medmnist API | mock: rand)
+               |
+               +---> src/supernet.py :: TaskAwareSupernet
+               |         |
+               |         +---> src/ops.py :: MixedOp, 7 primitives
+               |         +---> src/normalizers.py :: annealed_sparsemax
+               |
+               +---> src/controller.py :: SearchController
+               |         |
+               |         +---> src/losses.py   :: task_loss
+               |         +---> src/metrics.py  :: alpha_entropy
+               |         +---> src/normalizers.py
+               |
+               +---> src/retrain.py :: retrain_discrete
+               |         |
+               |         +---> src/losses.py  :: task_loss
+               |         +---> src/metrics.py :: evaluate_task
+               |
+               +---> src/metrics.py   :: evaluate
+               +---> src/reporting.py :: print_benchmark / save_benchmark
+                              |
+                              +---> results/benchmark_table.txt
+                              +---> results/benchmark_results.json
+```
+
+---
+
+## 17. Reproducibility Checklist
+
+1. Seeds      -- --seed 42 (default).  Applied to numpy, torch, random.
+2. Data       -- official MedMNIST train/val/test splits, no leakage.
+3. Normaliz.  -- per-task mean/std constants fixed in src/data.py.
+4. Compute    -- report device, memory, wall-clock time (search + retrain).
+5. Params     -- reported per task in benchmark table (n_params column).
+6. Multi-seed -- run 3-5 seeds, report mean +/- std for AUC and ACC.
+7. Artifacts  -- checkpoints -> ckpt-dir;  JSON -> save-dir.
+
+---
+
+## 18. Suggested Ablations
+
+1. Sparsemax vs softmax for alpha normalization.
+2. Temperature annealing on/off; different anneal factors {0.5, 0.75, 0.9}.
+3. Alpha update frequency sweep: {1, 5, 10, 20}.
+4. Entropy early stopping on/off.
+5. Search space: drop Zero, drop DilatedConv3x3, drop SE branch.
+6. Shared vs task-specific alpha parameters.
+7. Mixup on/off; label smoothing on/off.
+8. img_size: 28 vs 64 vs 128.
+
+---
+
+## 19. Paper Paragraph (Drop-in Draft)
+
+"We propose MT-DARTS v2, a task-aware differentiable NAS framework for
+multi-task MedMNIST classification.  The method uses a shared supernet
+with task-specific architecture logits over a seven-operator search space
+(MBConv3x3, MBConv5x5, MBConvSE, DilatedConv3x3, SepConv5x5, SkipConnect,
+Zero).  Architecture weights are computed via annealed sparsemax, yielding
+sparse, progressively sharper operator distributions.  Network weights and
+architecture parameters are optimized in a bilevel loop with delayed
+architecture updates (every 10 steps) to stabilize search.  Label smoothing
+(epsilon=0.1) is applied to CE tasks during both search and retraining.
+Convergence is monitored via mean architecture entropy, enabling principled
+early stopping.  After search, each task architecture is discretized by
+argmax selection and retrained for 200 epochs with Mixup (alpha=0.2) and a
+linear-warmup cosine schedule, reporting ACC and AUC per task and macro
+averages."
+
+---
+
+## 20. Known Implementation Notes
+
+1. Mixed-task DataLoader emits (image, label, task_id) tuples; all modules
+   filter by task_id before computing losses or metrics.
+2. ChestMNIST is loaded with as_rgb=True; grayscale mock images are
+   expanded to 3 channels with .repeat(3,1,1).
+3. AUC is undefined when only one class is present in a batch; the
+   implementation falls back to ACC gracefully.
+4. RandAugment requires uint8 input; the transform pipeline does
+   float->uint8 before RandAugment and uint8->float32 after.
+5. SEBlock uses bias=False Linear layers; _init_weights in both
+   supernet.py and retrain.py guard against None bias with explicit checks.
