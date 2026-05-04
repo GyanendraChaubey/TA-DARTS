@@ -55,8 +55,8 @@ class SearchController:
         grad_clip:         float = 5.0,
         eta_min:           float = 1e-4,
         tau_init:          float = 1.5,
-        anneal_factor:     float = 0.75,
-        anneal_interval:   int   = 5,
+        anneal_factor:     float = 0.85,
+        anneal_interval:   int   = 10,
         tau_min:           float = 0.1,
         alpha_update_freq: int   = 10,
         label_smoothing:   float = 0.0,
@@ -130,6 +130,28 @@ class SearchController:
             total_loss = total_loss / n_samples
         return total_loss
 
+    def _compute_per_task_losses(
+        self,
+        images:   torch.Tensor,
+        labels:   list,
+        task_ids: torch.Tensor,
+        device:   torch.device,
+    ) -> list:
+        """Return list of (loss_k, n_k) for each task present in the batch."""
+        results = []
+        for k in range(self.num_tasks):
+            mask = (task_ids == k)
+            if not mask.any():
+                continue
+            imgs_k   = images[mask]
+            labels_k = [labels[i]
+                        for i in mask.nonzero(as_tuple=True)[0].tolist()]
+            logits_k = self.model(imgs_k, k, tau=self._current_tau)
+            loss_k   = task_loss(logits_k, labels_k, k, device,
+                                 self.label_smoothing)
+            results.append((loss_k, mask.sum().item()))
+        return results
+
     # ── Bilevel step ──────────────────────────────────────────────────────────
 
     def step(
@@ -151,13 +173,34 @@ class SearchController:
         tids_tr   = tids_tr.to(device)
         tids_va   = tids_va.to(device)
 
-        # ── Phase 1: weight update (alphas frozen) ───────────────────────────
+        # ── Phase 1: weight update with gradient normalization ───────────────
+        # Each task's gradients are scaled to unit norm before accumulation
+        # so no single task (e.g. PathMNIST with 89k samples) dominates.
         self.model.alphas.requires_grad_(False)
         self.opt_weights.zero_grad()
-        loss_w = self._compute_loss(images_tr, labels_tr, tids_tr, device)
-        loss_w.backward()
-        nn.utils.clip_grad_norm_(self.model.weight_parameters(), self.grad_clip)
+
+        task_losses = self._compute_per_task_losses(
+            images_tr, labels_tr, tids_tr, device
+        )
+        loss_w_val = 0.0
+        params = list(self.model.weight_parameters())
+        for loss_k, n_k in task_losses:
+            loss_k.backward(retain_graph=True)
+            # Normalize this task's contribution by its gradient norm
+            total_norm = torch.norm(
+                torch.stack([
+                    p.grad.norm() for p in params if p.grad is not None
+                ])
+            ).item()
+            if total_norm > 0:
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.data.mul_(1.0 / total_norm)
+            loss_w_val += loss_k.item()
+        # Zero out any None grads that may remain, then clip and step
+        nn.utils.clip_grad_norm_(params, self.grad_clip)
         self.opt_weights.step()
+        loss_w = loss_w_val / max(len(task_losses), 1)
 
         # ── Phase 2: alpha update (every alpha_update_freq steps) [C] ────────
         loss_a_val = 0.0
@@ -176,7 +219,7 @@ class SearchController:
             self.model.alphas.requires_grad_(True)
 
         self._step += 1
-        return loss_w.item(), loss_a_val
+        return loss_w, loss_a_val
 
     # ── Scheduler (call once per epoch) ──────────────────────────────────────
 

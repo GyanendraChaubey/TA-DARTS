@@ -161,9 +161,21 @@ Over time the temperature falls, making the votes sharper.  A minimum
 temperature floor prevents votes from becoming so extreme that the gradient
 signal breaks down (a failure mode called sparsemax collapse).
 
+The three tasks are very unequal in size — the tissue-sample task has about
+89,000 training images while the skin-lesion task has only 7,000.  Without
+correction, the large task would dominate the learning and the small task
+would barely influence the shared network.  To prevent this, the system
+normalises each task's "teaching signal" to the same size before combining
+them.  Think of it as giving every subject teacher the same number of votes
+in a curriculum meeting, regardless of class size.
+
 There is a clever stopping rule: the system measures how "decided" the votes
 are.  Once the votes are decisive enough (low entropy), it stops early — no
-point running longer when the choice is already clear.
+point running longer when the choice is already clear.  There is also a
+patience rule: if the best combined accuracy across all three tasks has not
+improved for 10 rounds in a row, training stops.  And if accuracy suddenly
+drops sharply, the vote weights are automatically rolled back to the last
+good snapshot (the "rewind" safety net).
 
 ### Stage 2 — Commit (pick the winner)
 

@@ -199,12 +199,24 @@ After AdaptiveAvgPool2d(1) + Flatten  ->  (B, C):
 ### 6.2 Per-step update rule
 
 ```
-  Every step:
-  |   loss_w = task_loss( supernet(train_imgs, task, tau), labels )
-  |   w  <--  w - eta_w * grad_w( loss_w )
+  Every step — weight update with per-task gradient normalization:
+
+  For each task k present in the train mini-batch:
+  |   loss_k  = task_loss( supernet(train_imgs_k, k, tau), labels_k )
+  |   g_k     = grad_w( loss_k )             -- gradient on shared weights
+  |   g_k    /= ||g_k||_2                    -- normalize to unit norm
+  |   accumulate g_k into w.grad
+
+  After all tasks accumulated:
+  |   clip_grad_norm_(w, max_norm=5)
+  |   w  <--  w - eta_w * w.grad
+
+  Gradient normalization ensures all tasks contribute equally to the shared
+  weight update regardless of dataset size differences (PathMNIST ~89k vs
+  DermaMNIST ~7k samples).
 
   Every alpha_update_freq steps  (default = 10):
-  |   loss_a = task_loss( supernet(val_imgs,   task, tau), val_labels )
+  |   loss_a = task_loss( supernet(val_imgs, task, tau), val_labels )
   |   alpha  <--  alpha - eta_a * grad_a( loss_a )
 ```
 
@@ -213,8 +225,8 @@ After AdaptiveAvgPool2d(1) + Flatten  ->  (B, C):
     tau_e = max( tau_0 * a ^ floor(e / m),  tau_min )
 
     tau_0    = 1.5    --tau_init
-    a        = 0.75   --anneal_factor   (recommended: 0.85 for stable search)
-    m        = 5      --anneal_interval
+    a        = 0.85   --anneal_factor   (default; 0.75 collapses by epoch 25)
+    m        = 10     --anneal_interval
     tau_min  = 0.1    --tau_min         (floor prevents sparsemax collapse)
 
 Operation weights:
@@ -307,6 +319,41 @@ Eval transforms: Resize (if needed) + Normalize only.
   | DermaMNIST  (task_id=2)   | CrossEntropyLoss(smooth=0.1)     |
   +---------------------------+-----------------------------------+
 ```
+
+Class-imbalance weighting:
+
+```
+  DermaMNIST  -- CrossEntropyLoss(weight=_DERMA_CLASS_WEIGHTS)
+                 [1.0, 1.0, 1.0, 1.0, 5.0, 1.0, 2.0]
+                 (melanoma class upweighted 5x, dermatofibroma 2x)
+
+  ChestMNIST  -- BCEWithLogitsLoss(pos_weight=ones(14)*10.0)
+                 (all 14 conditions are rare; positives upweighted 10x)
+
+  PathMNIST   -- no extra weighting (classes are roughly balanced)
+```
+
+Combined with per-task gradient normalization in SearchController (Section
+6.2), task contributions are balanced at both the loss level (class weights)
+and the gradient level (unit-norm scaling per task).
+
+Class-imbalance weighting (defined in losses.py):
+
+```
+  DermaMNIST  -- CrossEntropyLoss(weight=_DERMA_CLASS_WEIGHTS)
+                 _DERMA_CLASS_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 5.0, 1.0, 2.0]
+                 (class 4 = melanoma upweighted 5x, class 6 = dermatofibroma 2x)
+
+  ChestMNIST  -- BCEWithLogitsLoss(pos_weight=_CHEST_POS_WEIGHT)
+                 _CHEST_POS_WEIGHT = ones(14) * 10.0
+                 (all 14 conditions are rare; positive samples upweighted 10x)
+
+  PathMNIST   -- no extra weighting (classes are roughly balanced)
+```
+
+Combined with per-task gradient normalization in SearchController, the
+effective task contribution during weight updates is equalised both at the
+loss level (class weights) and at the gradient level (unit-norm scaling).
 
 ---
 
@@ -411,9 +458,11 @@ Passed directly to retrain_discrete().
 | LR weights          |    0.025 | --lr_w                           |
 | LR alphas           |    3e-4  | --lr_a                           |
 | tau_init            |      1.5 | --tau_init                       |
-| anneal_factor       |     0.75 | --anneal_factor                  |
-| anneal_interval     |        5 | --anneal_interval                |
+| anneal_factor       |     0.85 | --anneal_factor                  |
+| anneal_interval     |       10 | --anneal_interval                |
 | tau_min             |      0.1 | --tau_min  (collapse floor)      |
+| auc_patience        |       10 | --auc_patience                   |
+| rewind_thresh       |     0.10 | --rewind_thresh                  |
 | alpha_update_freq   |       10 | --alpha_freq                     |
 | entropy_threshold   |     0.05 | --entropy_thresh                 |
 | Retrain epochs      |      200 | --retrain_epochs                 |

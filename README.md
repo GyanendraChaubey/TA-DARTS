@@ -83,6 +83,14 @@ snapshotted whenever mean AUC across all tasks improves. Phase B uses this
 best-AUC snapshot — not the final epoch — to choose operations. This makes
 the discovered architecture robust to late-search instability.
 
+**Task-balanced training.** Three sources of imbalance exist: dataset size
+(PathMNIST 89k vs DermaMNIST 7k), class frequency within each task, and
+loss-scale differences across task types (CE vs BCE). The system addresses
+all three: class-frequency weights in `losses.py`, and per-task gradient
+normalization in `SearchController` — each task's gradient is scaled to
+unit norm before being accumulated, so no single task dominates the shared
+weight update.
+
 ---
 
 ## Search space (7 operations)
@@ -105,14 +113,16 @@ the discovered architecture robust to late-search instability.
 |---------------------|---------|-----------------------------------------------|
 | `--epochs`          | 50      | Search epochs                                 |
 | `--tau_init`        | 1.5     | Starting sparsemax temperature                |
-| `--anneal_factor`   | 0.75    | Temperature decay per interval (0.85 = safer) |
-| `--anneal_interval` | 5       | Epochs between decay steps                    |
+| `--anneal_factor`   | 0.85    | Temperature decay per interval                |
+| `--anneal_interval` | 10      | Epochs between decay steps                    |
 | `--tau_min`         | 0.1     | Temperature floor — prevents collapse         |
+| `--auc_patience`    | 10      | Early-stop if mean AUC stalls for N epochs    |
+| `--rewind_thresh`   | 0.10    | Rewind alphas if AUC drops >10%               |
 | `--retrain_epochs`  | 200     | Epochs for discrete model retraining          |
 | `--alpha_freq`      | 10      | Update alpha every N weight steps             |
 | `--entropy_thresh`  | 0.05    | Early-stop when architecture entropy < this  |
 
-> **Note on `--tau_min`:** with `anneal_factor=0.75` and 60 search epochs,
+> **Note on `--tau_min`:** with the old default `anneal_factor=0.75` and 60 search epochs,
 > tau decays to ~0.047 without a floor. Below ~0.2, sparsemax gradients
 > degrade and architecture weights collapse. Set `--tau_min 0.25` for runs
 > over 20 epochs.
