@@ -123,8 +123,10 @@ def retrain_discrete(
         milestones=[warmup_epochs],
     )
 
-    best_val_auc: float = -1.0
-    best_state         = None
+    best_val_auc: float  = -1.0
+    best_state           = None
+    retrain_patience     = 20
+    retrain_no_improve   = 0
 
     for epoch in range(1, num_epochs + 1):
         discrete_model.train()
@@ -198,8 +200,18 @@ def retrain_discrete(
                 f"  val_AUC={val_metrics['auc']:.4f}"
             )
         if val_metrics["auc"] > best_val_auc:
-            best_val_auc = val_metrics["auc"]
-            best_state   = copy.deepcopy(discrete_model.state_dict())
+            best_val_auc       = val_metrics["auc"]
+            best_state         = copy.deepcopy(discrete_model.state_dict())
+            retrain_no_improve = 0
+        else:
+            retrain_no_improve += 1
+            if retrain_no_improve >= retrain_patience:
+                logger.info(
+                    f"  [{task_name}] Early stopping at epoch {epoch}"
+                    f" — no val AUC improvement for {retrain_patience} epochs"
+                    f" (best={best_val_auc:.4f})."
+                )
+                break
 
     if best_state is not None:
         discrete_model.load_state_dict(best_state)

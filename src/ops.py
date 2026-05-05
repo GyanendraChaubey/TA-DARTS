@@ -1,8 +1,11 @@
 """
-Primitive operations for the 7-op search space, plus MixedOp.
+Primitive operations for the 10-op search space, plus MixedOp.
 
-Search space:  MBConv3x3 | MBConv5x5 | MBConvSE | DilatedConv3x3 | SepConv5x5
-             | SkipConnect | Zero
+Search space:  MBConv3x3 | MBConv5x5 | MBConvSE | DilatedConv3x3 | DilatedConv5x5
+             | SepConv3x3 | SepConv5x5 | SkipConnect | AvgPool3x3 | MaxPool3x3
+
+Note: Zero was removed from the search space. In a sequential chain architecture
+a Zero op kills all downstream gradient flow; AvgPool3x3 is the replacement.
 """
 from __future__ import annotations
 
@@ -98,6 +101,25 @@ class DilatedConv3x3(nn.Module):
         return self.op(x) + x
 
 
+class DilatedConv5x5(nn.Module):
+    """Depthwise-separable dilated 5×5 conv, dilation=2  →  effective RF ≈ 9×9."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.op = nn.Sequential(
+            nn.Conv2d(channels, channels, 5, padding=4, dilation=2,
+                      groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU6(inplace=True),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.op(x) + x
+
+
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation channel attention."""
 
@@ -135,6 +157,25 @@ class MBConvSE(nn.Module):
         return self.se(self.conv(x)) + x
 
 
+class SepConv3x3(nn.Module):
+    """Depthwise-separable 3×3 conv — efficient local feature extraction."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.op = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1,
+                      groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU6(inplace=True),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.op(x) + x
+
+
 class SepConv5x5(nn.Module):
     """Depthwise-separable 5×5 conv — wider receptive field for skin lesions."""
 
@@ -159,14 +200,26 @@ class SkipConnect(nn.Module):
         return x
 
 
-class Zero(nn.Module):
-    """
-    Drops this edge entirely — returns zeros_like so the alpha gradient
-    for this op is always zero; the optimizer can freely push its weight
-    to –∞ without producing NaN.
-    """
+class AvgPool3x3(nn.Module):
+    """3×3 average pooling — smooth spatial feature aggregation."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.op = nn.AvgPool2d(3, stride=1, padding=1)
+
     def forward(self, x: Tensor) -> Tensor:
-        return torch.zeros_like(x)
+        return self.op(x)
+
+
+class MaxPool3x3(nn.Module):
+    """3×3 max pooling — preserves dominant activations and sharp features."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.op = nn.MaxPool2d(3, stride=1, padding=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.op(x)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -178,20 +231,26 @@ OP_NAMES: List[str] = [
     "MBConv5x5",
     "MBConvSE",
     "DilatedConv3x3",
+    "DilatedConv5x5",
+    "SepConv3x3",
     "SepConv5x5",
     "SkipConnect",
-    "Zero",
+    "AvgPool3x3",
+    "MaxPool3x3",
 ]
-NUM_OPS = len(OP_NAMES)  # 7
+NUM_OPS = len(OP_NAMES)  # 10
 
 _OP_REGISTRY = {
     "MBConv3x3":      MBConv3x3,
     "MBConv5x5":      MBConv5x5,
     "MBConvSE":       MBConvSE,
     "DilatedConv3x3": DilatedConv3x3,
+    "DilatedConv5x5": DilatedConv5x5,
+    "SepConv3x3":     SepConv3x3,
     "SepConv5x5":     SepConv5x5,
     "SkipConnect":    lambda c: SkipConnect(),
-    "Zero":           lambda c: Zero(),
+    "AvgPool3x3":     AvgPool3x3,
+    "MaxPool3x3":     MaxPool3x3,
 }
 
 

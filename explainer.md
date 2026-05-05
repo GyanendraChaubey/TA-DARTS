@@ -63,31 +63,47 @@ image tasks at the same time, sharing most of the work.
 
 ---
 
-## The seven machines (operations) to choose from
+## The ten machines (operations) to choose from
 
-At each position on the assembly line, one of seven possible processing steps
+At each position on the assembly line, one of ten possible processing steps
 can be chosen:
 
 ```
-+---+----------------+--------------------------------------------------+
-| # | Name           | What it does (plain English)                     |
-+---+----------------+--------------------------------------------------+
-| 1 | MBConv3x3      | Looks at small 3x3 patches, finds patterns       |
-| 2 | MBConv5x5      | Looks at slightly larger 5x5 patches             |
-| 3 | MBConvSE       | Like MBConv3x3 but also decides which features   |
-|   |                | are most important and amplifies them            |
-| 4 | DilatedConv3x3 | Looks at a wider area with gaps in between --    |
-|   |                | captures bigger-picture context                  |
-| 5 | SepConv5x5     | An efficient 5x5 scanner that uses fewer         |
-|   |                | calculations                                     |
-| 6 | SkipConnect    | Passes the image through unchanged (a shortcut)  |
-| 7 | Zero           | Discards the output entirely (turns off a layer) |
-+---+----------------+--------------------------------------------------+
++----+----------------+--------------------------------------------------+
+| #  | Name           | What it does (plain English)                     |
++----+----------------+--------------------------------------------------+
+|  1 | MBConv3x3      | Looks at small 3x3 patches, finds patterns       |
+|  2 | MBConv5x5      | Looks at slightly larger 5x5 patches             |
+|  3 | MBConvSE       | Like MBConv3x3 but also decides which features   |
+|    |                | are most important and amplifies them            |
+|  4 | DilatedConv3x3 | Looks at a wider area with gaps in between --    |
+|    |                | captures bigger-picture context (moderate range) |
+|  5 | DilatedConv5x5 | Same idea but covers an even wider area --       |
+|    |                | useful for diffuse patterns across a whole X-ray |
+|  6 | SepConv3x3     | An efficient small-patch scanner using fewer     |
+|    |                | calculations than a standard 3x3                 |
+|  7 | SepConv5x5     | An efficient larger-patch scanner                |
+|  8 | SkipConnect    | Passes the image through unchanged (a shortcut)  |
+|  9 | AvgPool3x3     | Smooths out each local area by averaging --      |
+|    |                | good for diffuse, low-contrast regions           |
+| 10 | MaxPool3x3     | Picks the strongest signal in each patch --      |
+|    |                | good for sharp edges and lesion boundaries       |
++----+----------------+--------------------------------------------------+
 ```
 
 The "SE" in MBConvSE stands for Squeeze-and-Excitation — it is a small
 attention mechanism that asks "of all the features I found, which ones matter
 most for this image?" and dials the rest down.
+
+> **Why no "Zero" (turn the layer off) option?**
+> Earlier versions included a Zero option. In theory this sounds useful.
+> In practice, when the computer chose Zero for any layer on the sequential
+> assembly line, it broke every layer after it too — nothing could flow
+> through. The computer worked around this during the search phase (when all
+> machines run in parallel), but after committing to the winning architecture
+> and retraining from scratch there was no workaround. The result was
+> guaranteed random guessing no matter how long retraining ran. AvgPool3x3
+> replaces Zero as a cheap low-impact option that does not kill the network.
 
 ---
 
@@ -177,7 +193,7 @@ improved for 10 rounds in a row, training stops.  And if accuracy suddenly
 drops sharply, the vote weights are automatically rolled back to the last
 good snapshot (the "rewind" safety net).
 
-### Stage 2 — Commit (pick the winner)
+### Stage 2 — Commit (pick the winner and verify it)
 
 At each of the 8 positions, simply pick the machine that got the most votes
 in the best-snapshot recorded during Stage 1.
@@ -190,6 +206,13 @@ Now we have a fixed, lean assembly line for each of the three tasks.
   Layer 2 -> MBConvSE
   ...
 ```
+
+Before moving on, the system checks each chosen assembly line for obvious
+problems.  If a line somehow contains a broken step (which can happen if
+an old saved file from a previous version is loaded), it logs a clear error
+message and skips retraining for that task rather than wasting hours training
+a broken network.  It also warns if too many steps are plain pass-throughs
+(SkipConnect), which would mean the line is barely doing any work.
 
 ### Stage 3 — Retrain (train the winner from scratch)
 
@@ -208,6 +231,11 @@ This retraining uses a few extra tricks to improve accuracy:
 - **Warmup then cosine cooldown** — the learning speed starts slow, ramps up,
   then gradually slows down to a gentle finish.  Like a car accelerating
   smoothly and braking gradually.
+- **Early stopping** — if the network’s accuracy on held-out images stops
+  improving for 20 rounds in a row, training stops automatically.  This saves
+  several hours of wasted compute if the architecture has already converged
+  (or is broken — a healthy network shows clear improvement well within 20
+  rounds).
 
 ### Stage 4 — Report
 
@@ -237,9 +265,10 @@ means perfect; 0.5 means random guessing.
   |                  | random flips, colour shifts, and other tricks  |
   |                  | to make the network more robust.               |
   +------------------+------------------------------------------------+
-  | src/ops.py       | Defines the 7 candidate machines and how       |
+  | src/ops.py       | Defines the 10 candidate machines and how       |
   |                  | MixedOp runs all of them in parallel during     |
-  |                  | the search phase.                              |
+  |                  | the search phase.  Zero was removed — in a     |
+  |                  | sequential line it breaks every layer after it. |
   +------------------+------------------------------------------------+
   | src/supernet.py  | Builds the full assembly line (stem + 8 layers |
   |                  | + 3 heads) and manages the vote weights.        |

@@ -52,21 +52,34 @@ pass, then retrain each selected architecture from scratch.
 
 ## 4. Search Space  (src/ops.py)
 
-Seven candidate operations, O = 7:
+Ten candidate operations, O = 10:
 
 ```
-+---+----------------+---------------------------------------------+
-| # | Name           | Description                                 |
-+---+----------------+---------------------------------------------+
-| 0 | MBConv3x3      | Inverted-residual, 3x3 dw, expansion 4      |
-| 1 | MBConv5x5      | Inverted-residual, 5x5 dw, expansion 6      |
-| 2 | MBConvSE       | MBConv3x3 + Squeeze-and-Excitation (r=4)    |
-| 3 | DilatedConv3x3 | Dilated depthwise 3x3 (dilation=2) + pw 1x1 |
-| 4 | SepConv5x5     | Depthwise-sep 5x5 + residual                |
-| 5 | SkipConnect    | Identity (residual pass-through)            |
-| 6 | Zero           | Zero tensor (drops the layer)               |
-+---+----------------+---------------------------------------------+
++---+----------------+----------------------------------------------+
+| # | Name           | Description                                  |
++---+----------------+----------------------------------------------+
+| 0 | MBConv3x3      | Inverted-residual, 3x3 dw, expansion 4       |
+| 1 | MBConv5x5      | Inverted-residual, 5x5 dw, expansion 6       |
+| 2 | MBConvSE       | MBConv3x3 + Squeeze-and-Excitation (r=4)     |
+| 3 | DilatedConv3x3 | Dilated dw 3x3 (dilation=2, RF≈5×5) + pw 1x1|
+| 4 | DilatedConv5x5 | Dilated dw 5x5 (dilation=2, RF≈9×9) + pw 1x1|
+| 5 | SepConv3x3     | Depthwise-sep 3x3 + residual                 |
+| 6 | SepConv5x5     | Depthwise-sep 5x5 + residual                 |
+| 7 | SkipConnect    | Identity (residual pass-through)             |
+| 8 | AvgPool3x3     | 3×3 average pooling (stride=1, pad=1)        |
+| 9 | MaxPool3x3     | 3×3 max pooling (stride=1, pad=1)            |
++---+----------------+----------------------------------------------+
 ```
+
+Design rationale:
+- Zero was removed from the search space.  In a sequential chain architecture
+  a Zero op kills all downstream gradient flow during retraining; AvgPool3x3
+  is the direct replacement providing a "do little" option without dead layers.
+- DilatedConv5x5 (RF≈9×9) complements DilatedConv3x3 (RF≈5×5), covering
+  diffuse spatial patterns in ChestMNIST at 16×16 feature maps.
+- SepConv3x3 complements SepConv5x5: local vs. wider efficient kernels.
+- MaxPool3x3 and AvgPool3x3 are complementary: max preserves dominant
+  activations (sharp edges, lesion boundaries); avg smooths spatial features.
 
 SEBlock inside MBConvSE:
   global-avg-pool -> Linear(C, C//4) -> ReLU -> Linear(C//4, C) -> Sigmoid
@@ -74,7 +87,7 @@ SEBlock inside MBConvSE:
 
 MixedOp (during search):
 
-    h_out = sum_{o=1}^{7}  pi_{t,l,o} * op_o(h_in)
+    h_out = sum_{o=1}^{10}  pi_{t,l,o} * op_o(h_in)
 
 where pi is computed by annealed sparsemax (see Section 6).
 
@@ -143,7 +156,8 @@ After AdaptiveAvgPool2d(1) + Flatten  ->  (B, C):
 ### 5.4 Architecture parameters
 
 ```
-  alpha   shape: (T=3, L=8, O=7)
+  alpha   shape: (T=3, L=8, O=10)
+  numel:  240
   init:   zeros
   optim:  Adam  (separate from network weights)
 ```
@@ -160,7 +174,7 @@ After AdaptiveAvgPool2d(1) + Flatten  ->  (B, C):
   +======================+
          | (B, 64, 16, 16)
          v
-  sparsemax(alpha_t / tau)  ->  pi_t  shape (L, 7)
+  sparsemax(alpha_t / tau)  ->  pi_t  shape (L, 10)
          |
   +------+------+--  ...  --+------+
   |             |            |      |
@@ -405,9 +419,53 @@ loss level (class weights) and at the gradient level (unit-norm scaling).
 Val AUC is evaluated every epoch.
 Best-AUC state is restored before test evaluation.
 
+### 9.5 Early stopping (patience = 20)
+
+If val AUC does not improve for 20 consecutive epochs, retraining halts
+early and the best checkpoint is used.  This prevents wasting compute
+when a discrete architecture has converged or is degenerate:
+
+```
+  retrain_patience   = 20
+  retrain_no_improve = 0
+
+  each epoch:
+    if val_auc > best_val_auc:
+        save best state
+        retrain_no_improve = 0
+    else:
+        retrain_no_improve += 1
+        if retrain_no_improve >= retrain_patience:
+            break
+```
+
 ---
 
-## 10. Discretization  (src/supernet.py :: discretize)
+## 10. Phase B Architecture Sanity Checks  (train.py)
+
+After discretization (Phase B) and before retraining (Phase C), each
+per-task architecture is validated:
+
+```
+  For each task k:
+    1. Log chosen architecture to console.
+
+    2. Hard block — if "Zero" appears anywhere in the architecture
+       (possible when loading a checkpoint from a pre-v2 run):
+         -> log ERROR and skip retraining for that task entirely.
+         Zero at any layer kills all downstream gradient flow.
+
+    3. Soft warning — if >= L/2 layers are SkipConnect:
+         -> log WARNING (degenerate all-identity chain).
+         Retraining still proceeds.
+```
+
+With Zero removed from the search space (Section 4) this guard acts as a
+safety net for old checkpoints loaded via --resume-from.
+
+---
+
+## 11. Discretization  (src/supernet.py :: discretize)
 
 For each task t, each layer l:
 
@@ -422,7 +480,7 @@ Passed directly to retrain_discrete().
 
 ---
 
-## 11. Metrics and Reporting
+## 12. Metrics and Reporting
 
 ```
   src/metrics.py
@@ -444,7 +502,7 @@ Passed directly to retrain_discrete().
 
 ---
 
-## 12. Default Hyperparameters
+## 13. Default Hyperparameters
 
 ```
 +---------------------+----------+----------------------------------+
@@ -491,7 +549,7 @@ python main.py \
 
 ---
 
-## 13. System Architecture Diagram
+## 14. System Architecture Diagram
 
 ```
   +================================================================+
@@ -530,7 +588,7 @@ python main.py \
   | mednist|  | ops  |  | norm |  | loss |  | metric| | loss | |metric|
   |  API   |  | .py  |  | .py  |  | .py  |  |  .py  | |  .py | | .py  |
   |        |  |      |  |      |  |      |  |       | |      | |      |
-  | 3 tasks|  | 7 ops|  |sparse|  |CE /  |  |entropy| |CE /  | |ACC / |
+  | 3 tasks|  | 10ops|  |sparse|  |CE /  |  |entropy| |CE /  | |ACC / |
   |        |  | Mixed|  | max  |  |BCE+LS|  |alpha_H| |BCE+LS| | AUC  |
   +--------+  | Op   |  |anneal|  +------+  +-------+ +------+ +------+
               +------+  +------+
@@ -550,7 +608,7 @@ python main.py \
 
 ---
 
-## 14. Supernet Internal Dataflow
+## 15. Supernet Internal Dataflow
 
 ```
   Input (B, 3, 64, 64)
@@ -563,7 +621,7 @@ python main.py \
   +==============================+
          | (B, 64, 16, 16)
          |
-  alpha_t (L, 7) --sparsemax(./tau)--> pi_t (L, 7)
+  alpha_t (L, 10) --sparsemax(./tau)--> pi_t (L, 10)
          |
          +-------------+-- ... --+-----------+
          |             |                     |
@@ -603,7 +661,7 @@ python main.py \
 
 ---
 
-## 15. Bilevel Optimization and Retraining Flow
+## 16. Bilevel Optimization and Retraining Flow
 
 ```
   +==============================================================+
@@ -677,7 +735,7 @@ python main.py \
 
 ---
 
-## 16. Module Dependency Map
+## 17. Module Dependency Map
 
 ```
   main.py
@@ -691,7 +749,7 @@ python main.py \
                |
                +---> src/supernet.py :: TaskAwareSupernet
                |         |
-               |         +---> src/ops.py :: MixedOp, 7 primitives
+               |         +---> src/ops.py :: MixedOp, 10 primitives
                |         +---> src/normalizers.py :: annealed_sparsemax
                |
                +---> src/controller.py :: SearchController
@@ -714,7 +772,7 @@ python main.py \
 
 ---
 
-## 17. Reproducibility Checklist
+## 18. Reproducibility Checklist
 
 1. Seeds      -- --seed 42 (default).  Applied to numpy, torch, random.
 2. Data       -- official MedMNIST train/val/test splits, no leakage.
@@ -726,39 +784,42 @@ python main.py \
 
 ---
 
-## 18. Suggested Ablations
+## 19. Suggested Ablations
 
 1. Sparsemax vs softmax for alpha normalization.
 2. Temperature annealing on/off; different anneal factors {0.5, 0.75, 0.9}.
 3. Alpha update frequency sweep: {1, 5, 10, 20}.
 4. Entropy early stopping on/off.
-5. Search space: drop Zero, drop DilatedConv3x3, drop SE branch.
+5. Search space: drop DilatedConv5x5, drop SE branch, add StandaloneSE.
 6. Shared vs task-specific alpha parameters.
 7. Mixup on/off; label smoothing on/off.
 8. img_size: 28 vs 64 vs 128.
 
 ---
 
-## 19. Paper Paragraph (Drop-in Draft)
+## 20. Paper Paragraph (Drop-in Draft)
 
 "We propose MT-DARTS v2, a task-aware differentiable NAS framework for
 multi-task MedMNIST classification.  The method uses a shared supernet
-with task-specific architecture logits over a seven-operator search space
-(MBConv3x3, MBConv5x5, MBConvSE, DilatedConv3x3, SepConv5x5, SkipConnect,
-Zero).  Architecture weights are computed via annealed sparsemax, yielding
-sparse, progressively sharper operator distributions.  Network weights and
-architecture parameters are optimized in a bilevel loop with delayed
-architecture updates (every 10 steps) to stabilize search.  Label smoothing
-(epsilon=0.1) is applied to CE tasks during both search and retraining.
-Convergence is monitored via mean architecture entropy, enabling principled
-early stopping.  After search, each task architecture is discretized by
-argmax selection and retrained for 200 epochs with Mixup (alpha=0.2) and a
-linear-warmup cosine schedule, reporting ACC and AUC per task and macro
-averages."
+with task-specific architecture logits over a ten-operator search space
+(MBConv3x3, MBConv5x5, MBConvSE, DilatedConv3x3, DilatedConv5x5, SepConv3x3,
+SepConv5x5, SkipConnect, AvgPool3x3, MaxPool3x3).  Zero was excluded from
+the search space: in a sequential chain architecture a Zero operation kills
+all downstream gradient flow during retraining, making it unsuitable for
+non-DAG supernets.  Architecture weights are computed via annealed sparsemax,
+yielding sparse, progressively sharper operator distributions.  Network
+weights and architecture parameters are optimized in a bilevel loop with
+delayed architecture updates (every 10 steps) to stabilize search.  Label
+smoothing (epsilon=0.1) is applied to CE tasks during both search and
+retraining.  Convergence is monitored via mean architecture entropy, enabling
+principled early stopping.  After search, each task architecture is
+discretized by argmax selection and retrained for up to 200 epochs with
+early stopping (patience=20), Mixup (alpha=0.2), and a linear-warmup cosine
+schedule, reporting ACC and AUC per task and macro averages."
 
 ---
 
-## 20. Known Implementation Notes
+## 21. Known Implementation Notes
 
 1. Mixed-task DataLoader emits (image, label, task_id) tuples; all modules
    filter by task_id before computing losses or metrics.

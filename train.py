@@ -326,6 +326,32 @@ def run_search(
         best_indices        = best_alphas[k].argmax(dim=-1).tolist()
         architectures[k]   = [OP_NAMES[i] for i in best_indices]
 
+    # ── Phase B sanity checks ─────────────────────────────────────────────────
+    _skip_retrain: set = set()
+    for k in range(model.num_tasks):
+        tname = MedMNISTDataset.TASK_NAMES.get(k, f"Task{k}")
+        arch  = architectures[k]
+        logger.info(f"  [{tname}] Discrete arch: {arch}")
+
+        # Hard block: Zero op anywhere (can happen if loading an old checkpoint
+        # from before Zero was removed from the search space).
+        if "Zero" in arch:
+            zero_layers = [i for i, op in enumerate(arch) if op == "Zero"]
+            logger.error(
+                f"  [{tname}] SKIP RETRAIN — architecture contains Zero at"
+                f" layer(s) {zero_layers}. Load a fresh checkpoint."
+            )
+            _skip_retrain.add(k)
+            continue
+
+        # Soft warning: degenerate all-skip architecture.
+        skip_count = arch.count("SkipConnect")
+        if skip_count >= len(arch) // 2:
+            logger.warning(
+                f"  [{tname}] {skip_count}/{len(arch)} layers are SkipConnect"
+                f" — architecture may be degenerate."
+            )
+
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE C: Retrain discrete architectures
     # ══════════════════════════════════════════════════════════════════════════
@@ -334,6 +360,8 @@ def run_search(
 
     benchmark_results: Dict[int, Dict[str, Any]] = {}
     for k in range(model.num_tasks):
+        if k in _skip_retrain:
+            continue
         result = retrain_discrete(
             discrete_model=discrete_models[k],
             task_id=k,

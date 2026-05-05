@@ -69,7 +69,7 @@ Phase D  Benchmark report (ASCII table + JSON)
 
 **Shared supernet, per-task alpha.** A single backbone with 8 searchable
 layers is shared across all tasks. Each task has its own architecture
-parameter tensor `alpha_t` of shape `(L=8, O=7)`, so the search finds
+parameter tensor `alpha_t` of shape `(L=8, O=10)`, so the search finds
 task-specific operation sequences within the shared feature extractor.
 
 **Annealed sparsemax.** Operation weights are computed as
@@ -93,17 +93,26 @@ weight update.
 
 ---
 
-## Search space (7 operations)
+## Search space (10 operations)
 
-| Op             | Description                                          |
-|----------------|------------------------------------------------------|
-| MBConv3x3      | Inverted residual, 3×3 depthwise, expansion 4        |
-| MBConv5x5      | Inverted residual, 5×5 depthwise, expansion 6        |
-| MBConvSE       | MBConv3×3 + Squeeze-and-Excitation (reduction r=4)   |
-| DilatedConv3x3 | Dilated depthwise 3×3 (dilation=2) + pointwise 1×1  |
-| SepConv5x5     | Depthwise-separable 5×5 + residual                   |
-| SkipConnect    | Identity pass-through                                |
-| Zero           | Zero tensor (layer dropped)                          |
+| Op             | Description                                                   |
+|----------------|---------------------------------------------------------------|
+| MBConv3x3      | Inverted residual, 3×3 depthwise, expansion 4                 |
+| MBConv5x5      | Inverted residual, 5×5 depthwise, expansion 6                 |
+| MBConvSE       | MBConv3×3 + Squeeze-and-Excitation (reduction r=4)            |
+| DilatedConv3x3 | Dilated depthwise 3×3 (dilation=2, RF≈5×5) + pointwise 1×1   |
+| DilatedConv5x5 | Dilated depthwise 5×5 (dilation=2, RF≈9×9) + pointwise 1×1   |
+| SepConv3x3     | Depthwise-separable 3×3 + residual                            |
+| SepConv5x5     | Depthwise-separable 5×5 + residual                            |
+| SkipConnect    | Identity pass-through                                         |
+| AvgPool3x3     | 3×3 average pooling — smooth spatial aggregation              |
+| MaxPool3x3     | 3×3 max pooling — preserves dominant activations              |
+
+> **Why no Zero?** In the original graph-based DARTS, Zero represents the
+> absence of an edge and is safe because other paths can route around it.
+> In a sequential chain, Zero at any layer kills all downstream gradient
+> flow during retraining, guaranteed AUC=0.5. AvgPool3x3 is the replacement:
+> it provides a low-cost "do little" option without dead layers.
 
 ---
 
@@ -118,7 +127,7 @@ weight update.
 | `--tau_min`         | 0.1     | Temperature floor — prevents collapse         |
 | `--auc_patience`    | 10      | Early-stop if mean AUC stalls for N epochs    |
 | `--rewind_thresh`   | 0.10    | Rewind alphas if AUC drops >10%               |
-| `--retrain_epochs`  | 200     | Epochs for discrete model retraining          |
+| `--retrain_epochs`  | 200     | Max epochs for discrete model retraining      |
 | `--alpha_freq`      | 10      | Update alpha every N weight steps             |
 | `--entropy_thresh`  | 0.05    | Early-stop when architecture entropy < this  |
 
@@ -151,7 +160,7 @@ train.py             Four-phase pipeline orchestrator
 src/
   supernet.py        TaskAwareSupernet (shared stem + MixedOps + 3 heads)
   controller.py      SearchController (bilevel optimiser, tau annealing)
-  ops.py             7 candidate operations + MixedOp
+  ops.py             10 candidate operations + MixedOp
   normalizers.py     sparsemax / annealed_sparsemax
   data.py            MedMNISTDataset + DataLoader builder
   losses.py          CE (PathMNIST, DermaMNIST) / BCE (ChestMNIST)
