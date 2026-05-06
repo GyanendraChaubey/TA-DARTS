@@ -59,6 +59,7 @@ class SearchController:
         anneal_interval:   int   = 10,
         tau_min:           float = 0.1,
         alpha_update_freq: int   = 10,
+        search_micro_batch:int   = 0,
         label_smoothing:   float = 0.0,
     ) -> None:
         self.model             = model
@@ -75,6 +76,8 @@ class SearchController:
 
         # Contrib. [C] — delayed alpha updates
         self.alpha_update_freq = alpha_update_freq
+        # 0 means "use full batch". If >0, search updates run in micro-batches.
+        self.search_micro_batch = max(int(search_micro_batch), 0)
 
         # Label smoothing for CE tasks during search
         self.label_smoothing   = label_smoothing
@@ -130,27 +133,71 @@ class SearchController:
             total_loss = total_loss / n_samples
         return total_loss
 
-    def _compute_per_task_losses(
+    def _run_microbatched_backward(
         self,
-        images:   torch.Tensor,
-        labels:   list,
+        images: torch.Tensor,
+        labels: list,
         task_ids: torch.Tensor,
-        device:   torch.device,
-    ) -> list:
-        """Return list of (loss_k, n_k) for each task present in the batch."""
-        results = []
-        for k in range(self.num_tasks):
-            mask = (task_ids == k)
-            if not mask.any():
-                continue
-            imgs_k   = images[mask]
-            labels_k = [labels[i]
-                        for i in mask.nonzero(as_tuple=True)[0].tolist()]
-            logits_k = self.model(imgs_k, k, tau=self._current_tau)
-            loss_k   = task_loss(logits_k, labels_k, k, device,
-                                 self.label_smoothing)
-            results.append((loss_k, mask.sum().item()))
-        return results
+        device: torch.device,
+        micro_batch_size: int,
+    ) -> float:
+        """Backpropagate averaged batch loss by chunking to reduce peak memory."""
+        batch_size = images.size(0)
+        if batch_size == 0:
+            return 0.0
+
+        if micro_batch_size <= 0 or micro_batch_size >= batch_size:
+            loss = self._compute_loss(images, labels, task_ids, device)
+            loss.backward()
+            return float(loss.item())
+
+        loss_value = 0.0
+        for start in range(0, batch_size, micro_batch_size):
+            end = min(start + micro_batch_size, batch_size)
+            chunk_loss = self._compute_loss(
+                images[start:end], labels[start:end], task_ids[start:end], device
+            )
+            scale = float(end - start) / float(batch_size)
+            (chunk_loss * scale).backward()
+            loss_value += float(chunk_loss.item()) * scale
+        return loss_value
+
+    def _step_impl(
+        self,
+        images_tr: torch.Tensor,
+        labels_tr: list,
+        tids_tr: torch.Tensor,
+        images_va: torch.Tensor,
+        labels_va: list,
+        tids_va: torch.Tensor,
+        device: torch.device,
+        micro_batch_size: int,
+    ) -> Tuple[float, float]:
+        # Phase 1: update weights, freeze alphas.
+        self.model.alphas.requires_grad_(False)
+        self.opt_weights.zero_grad(set_to_none=True)
+        loss_w = self._run_microbatched_backward(
+            images_tr, labels_tr, tids_tr, device, micro_batch_size
+        )
+        nn.utils.clip_grad_norm_(list(self.model.weight_parameters()), self.grad_clip)
+        self.opt_weights.step()
+
+        # Phase 2: update alphas on schedule.
+        loss_a_val = 0.0
+        if (self._step + 1) % self.alpha_update_freq == 0:
+            self.model.alphas.requires_grad_(True)
+            self.opt_arch.zero_grad(set_to_none=True)
+            for p in self.model.weight_parameters():
+                p.grad = None
+
+            loss_a_val = self._run_microbatched_backward(
+                images_va, labels_va, tids_va, device, micro_batch_size
+            )
+            self.opt_arch.step()
+        else:
+            self.model.alphas.requires_grad_(True)
+
+        return loss_w, loss_a_val
 
     # ── Bilevel step ──────────────────────────────────────────────────────────
 
@@ -168,58 +215,61 @@ class SearchController:
         """
         images_tr, labels_tr, tids_tr = train_batch
         images_va, labels_va, tids_va = val_batch
-        images_tr = images_tr.to(device)
-        images_va = images_va.to(device)
-        tids_tr   = tids_tr.to(device)
-        tids_va   = tids_va.to(device)
+        images_tr = images_tr.to(device, non_blocking=True)
+        images_va = images_va.to(device, non_blocking=True)
+        tids_tr   = tids_tr.to(device, non_blocking=True)
+        tids_va   = tids_va.to(device, non_blocking=True)
 
-        # ── Phase 1: weight update with gradient normalization ───────────────
-        # Each task's gradients are scaled to unit norm before accumulation
-        # so no single task (e.g. PathMNIST with 89k samples) dominates.
-        self.model.alphas.requires_grad_(False)
-        self.opt_weights.zero_grad()
+        preferred_micro_batch = self.search_micro_batch or images_tr.size(0)
 
-        task_losses = self._compute_per_task_losses(
-            images_tr, labels_tr, tids_tr, device
-        )
-        loss_w_val = 0.0
-        params = list(self.model.weight_parameters())
-        for loss_k, n_k in task_losses:
-            loss_k.backward(retain_graph=True)
-            # Normalize this task's contribution by its gradient norm
-            total_norm = torch.norm(
-                torch.stack([
-                    p.grad.norm() for p in params if p.grad is not None
-                ])
-            ).item()
-            if total_norm > 0:
-                for p in params:
-                    if p.grad is not None:
-                        p.grad.data.mul_(1.0 / total_norm)
-            loss_w_val += loss_k.item()
-        # Zero out any None grads that may remain, then clip and step
-        nn.utils.clip_grad_norm_(params, self.grad_clip)
-        self.opt_weights.step()
-        loss_w = loss_w_val / max(len(task_losses), 1)
+        try:
+            loss_w, loss_a_val = self._step_impl(
+                images_tr,
+                labels_tr,
+                tids_tr,
+                images_va,
+                labels_va,
+                tids_va,
+                device,
+                preferred_micro_batch,
+            )
+        except torch.OutOfMemoryError:
+            if device.type != "cuda":
+                raise
 
-        # ── Phase 2: alpha update (every alpha_update_freq steps) [C] ────────
-        loss_a_val = 0.0
-        if (self._step + 1) % self.alpha_update_freq == 0:
-            self.model.alphas.requires_grad_(True)
-            self.opt_arch.zero_grad(set_to_none=True)
-            for p in self.model.weight_parameters():
-                p.grad = None
+            torch.cuda.empty_cache()
+            fallback = min(images_tr.size(0), max(1, preferred_micro_batch // 2))
+            recovered = False
+            while fallback >= 1:
+                try:
+                    logger.warning(
+                        "CUDA OOM at step %d. Retrying with search_micro_batch=%d",
+                        self._step,
+                        fallback,
+                    )
+                    loss_w, loss_a_val = self._step_impl(
+                        images_tr,
+                        labels_tr,
+                        tids_tr,
+                        images_va,
+                        labels_va,
+                        tids_va,
+                        device,
+                        fallback,
+                    )
+                    recovered = True
+                    break
+                except torch.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    if fallback == 1:
+                        break
+                    fallback = max(1, fallback // 2)
 
-            loss_a = self._compute_loss(images_va, labels_va, tids_va, device)
-            loss_a.backward()
-            self.opt_arch.step()
-            loss_a_val = loss_a.item()
-        else:
-            # Re-enable grad for alphas so eval code can query them
-            self.model.alphas.requires_grad_(True)
+            if not recovered:
+                raise
 
         self._step += 1
-        return loss_w, loss_a_val
+        return float(loss_w), float(loss_a_val)
 
     # ── Scheduler (call once per epoch) ──────────────────────────────────────
 

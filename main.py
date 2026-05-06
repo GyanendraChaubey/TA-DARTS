@@ -95,6 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DataLoader num_workers")
     g3.add_argument("--img-size",       type=int,   default=64,
                     help="Input resolution: 28 | 64 | 128 (64 recommended)")
+    g3.add_argument("--search-micro-batch", type=int, default=0,
+                    help="Micro-batch size used only during search steps (0 = full batch)")
 
     return parser
 
@@ -140,4 +142,5 @@ if __name__ == "__main__":
         img_size          = args.img_size,
         mixup_alpha       = args.mixup_alpha,
         label_smoothing   = args.label_smoothing,
+        search_micro_batch= args.search_micro_batch,
     )

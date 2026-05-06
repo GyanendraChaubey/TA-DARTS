@@ -74,6 +74,7 @@ def run_search(
     img_size:          int          = 64,
     mixup_alpha:       float        = 0.2,
     label_smoothing:   float        = 0.1,
+    search_micro_batch:int          = 0,
 ) -> Dict[str, Any]:
     """
     Execute the full MT-DARTS v2 pipeline and return benchmark results.
@@ -122,6 +123,7 @@ def run_search(
         tau_min=tau_min,
         alpha_update_freq=alpha_update_freq,
         label_smoothing=label_smoothing,
+        search_micro_batch=search_micro_batch,
     )
 
     start_epoch = 1
