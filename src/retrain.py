@@ -29,6 +29,62 @@ from .supernet import TaskAwareSupernet
 logger = logging.getLogger("MT-DARTS")
 
 
+@torch.no_grad()
+def _calibrate_chest_thresholds(
+    model:     nn.Module,
+    val_loader: DataLoader,
+    device:    torch.device,
+    n_labels:  int = 14,
+) -> np.ndarray:
+    """
+    Find per-label decision thresholds that maximise multi-label accuracy
+    on the validation set for ChestMNIST (task 1).
+
+    Sweeps 20 evenly-spaced thresholds in [0.05, 0.95] per label and picks
+    the one with the highest per-label accuracy.  Returns an array of shape
+    (n_labels,) used at test-time instead of the fixed 0.5.
+    """
+    model.eval()
+    all_scores, all_labels = [], []
+    for images, labels, task_ids in val_loader:
+        mask = (task_ids == 1)
+        if not mask.any():
+            continue
+        imgs_k   = images[mask].to(device)
+        labels_k = [labels[i] for i in mask.nonzero(as_tuple=True)[0].tolist()]
+        logits   = model(imgs_k)
+        scores   = torch.sigmoid(logits).cpu().numpy()
+        lbl_np   = torch.stack(
+            [l if isinstance(l, torch.Tensor) else torch.tensor(l)
+             for l in labels_k]
+        ).numpy()
+        all_scores.append(scores)
+        all_labels.append(lbl_np)
+
+    if not all_scores:
+        return np.full(n_labels, 0.5)
+
+    y_score = np.concatenate(all_scores, axis=0)  # (N, 14)
+    y_true  = np.concatenate(all_labels, axis=0)  # (N, 14)
+    best_thresholds = np.full(n_labels, 0.5)
+
+    for c in range(n_labels):
+        best_acc = -1.0
+        for thr in np.linspace(0.05, 0.95, 20):
+            acc = np.mean((y_score[:, c] >= thr) == y_true[:, c])
+            if acc > best_acc:
+                best_acc = acc
+                best_thresholds[c] = thr
+
+    logger.info(
+        f"  [ChestMNIST] Calibrated thresholds (min={best_thresholds.min():.2f}"
+        f"  max={best_thresholds.max():.2f}"
+        f"  mean={best_thresholds.mean():.2f})"
+    )
+    model.train()
+    return best_thresholds
+
+
 def _reinit_weights(model: nn.Module) -> None:
     """Re-initialise all learnable tensors from scratch (DARTS convention)."""
     for m in model.modules():
@@ -105,7 +161,10 @@ def retrain_discrete(
 
     optimizer = torch.optim.SGD(
         discrete_model.parameters(),
-        lr=lr, momentum=0.9, weight_decay=weight_decay, nesterov=True,
+        lr=lr, momentum=0.9,
+        # DermaMNIST needs stronger L2 regularisation (small 7k dataset).
+        weight_decay=weight_decay * 10 if task_id == 2 else weight_decay,
+        nesterov=True,
     )
 
     # Warmup for first ~5% of epochs, then cosine anneal.
@@ -125,7 +184,9 @@ def retrain_discrete(
 
     best_val_auc: float  = -1.0
     best_state           = None
-    retrain_patience     = 20
+    # DermaMNIST is small (7k samples) — allow more patience so retraining
+    # does not stop prematurely before augmentation-driven gains appear.
+    retrain_patience     = 40 if task_id == 2 else 20
     retrain_no_improve   = 0
 
     for epoch in range(1, num_epochs + 1):
@@ -143,9 +204,12 @@ def retrain_discrete(
             labels_k = [labels[i] for i in idx_list]
 
             # ── Mixup ────────────────────────────────────────────────────────
-            use_mixup = mixup_alpha > 0.0 and images_k.size(0) >= 2
+            # DermaMNIST uses higher mixup alpha (0.4) for stronger
+            # regularisation on the small 7k training set.
+            effective_alpha = (mixup_alpha * 2.0) if (task_id == 2 and mixup_alpha > 0) else mixup_alpha
+            use_mixup = effective_alpha > 0.0 and images_k.size(0) >= 2
             if use_mixup:
-                lam  = float(np.random.beta(mixup_alpha, mixup_alpha))
+                lam  = float(np.random.beta(effective_alpha, effective_alpha))
                 lam  = max(lam, 1.0 - lam)   # keep dominant sample
                 shuf = torch.randperm(images_k.size(0), device=device)
                 images_k_mix   = lam * images_k + (1.0 - lam) * images_k[shuf]
@@ -176,8 +240,12 @@ def retrain_discrete(
                                               device, label_smoothing)
                 )
             else:
+                # DermaMNIST: use minimal label smoothing so decision
+                # boundaries stay sharp — critical for accuracy on a
+                # 7-class imbalanced dataset.
+                effective_ls = 0.02 if task_id == 2 else label_smoothing
                 loss = task_loss(logits, labels_k, task_id, device,
-                                 label_smoothing)
+                                 effective_ls)
 
             loss.backward()
             nn.utils.clip_grad_norm_(discrete_model.parameters(), grad_clip)
@@ -216,8 +284,18 @@ def retrain_discrete(
     if best_state is not None:
         discrete_model.load_state_dict(best_state)
 
+    # ChestMNIST: calibrate per-label thresholds on val set before test eval
+    # to maximise multi-label accuracy (fixed 0.5 is suboptimal with pos_weight=10).
+    if task_id == 1:
+        chest_thresholds = _calibrate_chest_thresholds(
+            discrete_model, val_loader, device, n_labels=14,
+        )
+    else:
+        chest_thresholds = None
+
     test_metrics = evaluate_task(
         discrete_model, test_loader, task_id, device, is_supernet=False,
+        chest_thresholds=chest_thresholds,
     )
     logger.info(
         f"  [{task_name}] FINAL TEST"

@@ -162,6 +162,13 @@ def run_search(
     best_tau            = tau_init
     best_alpha_epoch    = start_epoch
     auc_no_improve      = 0          # patience counter
+    # Derma-aware weighted snapshot: weights = [0.35 Path, 0.25 Chest, 0.40 Derma]
+    # Derma gets extra weight because it is the hardest task and is drowned out
+    # in a simple mean.  We track both and discretise from whichever is higher.
+    best_weighted_auc   = -1.0
+    best_weighted_alphas = model.alphas.detach().clone()
+    best_weighted_tau   = tau_init
+    best_weighted_epoch = start_epoch
 
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
@@ -222,6 +229,24 @@ def run_search(
             mean_auc = sum(
                 eval_results[k].get("auc", 0.0) for k in eval_results
             ) / max(len(eval_results), 1)
+
+            # Derma-aware weighted AUC (Path=0.35, Chest=0.25, Derma=0.40)
+            _w = {0: 0.35, 1: 0.25, 2: 0.40}
+            weighted_auc = sum(
+                _w.get(k, 1/3) * eval_results[k].get("auc", 0.0)
+                for k in eval_results
+            )
+            if weighted_auc > best_weighted_auc:
+                best_weighted_auc     = weighted_auc
+                best_weighted_alphas  = model.alphas.detach().clone()
+                best_weighted_tau     = controller._current_tau
+                best_weighted_epoch   = epoch
+                logger.info(
+                    f"  [best-α-weighted] Saved at epoch {epoch}"
+                    f"  weighted_auc={best_weighted_auc:.4f}"
+                    f"  (Derma={eval_results.get(2,{}).get('auc',0):.4f})"
+                )
+
             if mean_auc > best_mean_auc:
                 best_mean_auc      = mean_auc
                 best_alphas        = model.alphas.detach().clone()
@@ -291,6 +316,20 @@ def run_search(
         f"  Using alpha snapshot from epoch {best_alpha_epoch}"
         f" (mean AUC={best_mean_auc:.4f}) for discretization."
     )
+    logger.info(
+        f"  Derma-weighted snapshot: epoch {best_weighted_epoch}"
+        f" (weighted AUC={best_weighted_auc:.4f})."
+    )
+    # Use the Derma-weighted snapshot for discretisation — it leads to a
+    # better DermaMNIST architecture while typically preserving Path/Chest.
+    # Fall back to mean-AUC snapshot if weighted is somehow worse overall.
+    if best_weighted_auc >= best_mean_auc * 0.95:
+        logger.info("  → Using Derma-weighted alpha snapshot for Phase B.")
+        best_alphas = best_weighted_alphas
+        best_tau    = best_weighted_tau
+        best_alpha_epoch = best_weighted_epoch
+    else:
+        logger.info("  → Using mean-AUC alpha snapshot for Phase B (weighted snapshot was too far behind).")
 
     # ── Save per-task architecture snapshot to file (Fix 6) ───────────────────
     arch_snapshot_path = os.path.join(save_dir, "architecture_snapshot.txt")

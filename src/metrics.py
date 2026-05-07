@@ -8,7 +8,7 @@ Evaluation metrics for MT-DARTS v2.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -77,6 +77,7 @@ def evaluate_task(
     task_id:     int,
     device:      torch.device,
     is_supernet: bool = True,
+    chest_thresholds: "Optional[np.ndarray]" = None,
 ) -> Dict[str, float]:
     """
     Evaluate ``model`` on samples belonging to ``task_id`` in ``loader``.
@@ -84,11 +85,13 @@ def evaluate_task(
     Sets model.eval() for inference and restores model.train() afterwards.
 
     Args:
-        model       : Supernet (is_supernet=True) or discrete nn.Sequential.
-        loader      : Mixed-task DataLoader (collate_fn from MedMNISTDataset).
-        task_id     : Which task to filter and evaluate.
-        device      : Compute device.
-        is_supernet : If True call model(imgs, task_id); else call model(imgs).
+        model              : Supernet (is_supernet=True) or discrete nn.Sequential.
+        loader             : Mixed-task DataLoader (collate_fn from MedMNISTDataset).
+        task_id            : Which task to filter and evaluate.
+        device             : Compute device.
+        is_supernet        : If True call model(imgs, task_id); else call model(imgs).
+        chest_thresholds   : Optional (14,) array of per-label thresholds for
+                             ChestMNIST accuracy.  If None, uses 0.5 globally.
 
     Returns:
         {"acc": float, "auc": float, "loss": float, "n": int}
@@ -143,7 +146,12 @@ def evaluate_task(
     avg_loss = total_loss / n_batches
 
     if is_ml:
-        y_pred = (y_score >= 0.5).astype(np.float32)
+        if chest_thresholds is not None:
+            # Per-label calibrated thresholds (ChestMNIST retrain test eval).
+            thr    = chest_thresholds[np.newaxis, :]   # (1, 14) broadcast
+            y_pred = (y_score >= thr).astype(np.float32)
+        else:
+            y_pred = (y_score >= 0.5).astype(np.float32)
         acc    = float(np.mean(y_pred == y_true))
     else:
         y_pred      = np.argmax(y_score, axis=-1)

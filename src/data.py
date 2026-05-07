@@ -44,6 +44,26 @@ def _get_transforms(task_id: int, train: bool, img_size: int = 64):
         std    = _TASK_STD[task_id]
         resize = [T.Resize((img_size, img_size))] if img_size != 28 else []
         if train:
+            # DermaMNIST (task 2) gets heavier augmentation: it has only 7k
+            # train samples and severe class imbalance.  Strong colour and
+            # geometric perturbations act as an implicit regulariser and
+            # improve minority-class generalisation.
+            if task_id == 2:
+                return T.Compose([
+                    *resize,
+                    T.RandomHorizontalFlip(),
+                    T.RandomVerticalFlip(),
+                    T.RandomRotation(degrees=180),
+                    T.RandomAffine(degrees=0, translate=(0.1, 0.1),
+                                   scale=(0.85, 1.15), shear=10),
+                    T.ColorJitter(brightness=0.5, contrast=0.5,
+                                  saturation=0.4, hue=0.15),
+                    T.ConvertImageDtype(torch.uint8),
+                    T.RandAugment(num_ops=3, magnitude=12),
+                    T.ConvertImageDtype(torch.float32),
+                    T.RandomErasing(p=0.35, scale=(0.02, 0.15)),
+                    T.Normalize(mean=mean, std=std),
+                ])
             return T.Compose([
                 *resize,
                 T.RandomHorizontalFlip(),

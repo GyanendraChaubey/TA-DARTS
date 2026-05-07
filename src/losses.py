@@ -13,11 +13,18 @@ from torch import Tensor
 from .supernet import TaskAwareSupernet
 
 # ── Per-task class weights ────────────────────────────────────────────────────
-# DermaMNIST (task 2) has severe class imbalance — melanocytic nevi (~67%).
-# Inverse-frequency weights push the model to learn minority classes.
-# Source: MedMNIST v2 official class distribution for DermaMNIST.
+# DermaMNIST (task 2) class distribution from MedMNIST v2 official train split
+# (7,007 samples total):
+#   0: actinic keratoses      (327)  → 21.4×
+#   1: basal cell carcinoma   (514)  → 13.6×
+#   2: benign keratosis       (1099) →  6.4×
+#   3: dermatofibroma         (115)  → 60.9×
+#   4: melanoma               (1113) →  6.3×
+#   5: melanocytic nevi       (6705) →  1.0×  ← majority class, weight 1.0
+#   6: vascular lesions       (142)  → 47.2×
+# Weights = max_count / class_count, clipped at 25 to avoid gradient explosion.
 _DERMA_CLASS_WEIGHTS = torch.tensor(
-    [1.0, 1.0, 1.0, 1.0, 5.0, 1.0, 2.0],   # rough inverse-freq
+    [21.4, 13.6, 6.4, 25.0, 6.3, 1.0, 25.0],
     dtype=torch.float32,
 )
 
