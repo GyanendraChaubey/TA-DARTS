@@ -87,12 +87,20 @@ def run_search(
     device = torch.device(device_str)
     os.makedirs(save_dir, exist_ok=True)
 
-    # ── CSV writer for search training curves (Fix 2+5) ──────────────────────
+    # ── CSV writer for search training curves ────────────────────────────────
     csv_path = os.path.join(save_dir, "search_curves.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "PathMNIST_auc", "ChestMNIST_auc",
-                         "DermaMNIST_auc", "alpha_entropy", "tau"])
+        writer.writerow([
+            "epoch",
+            "PathMNIST_auc",  "PathMNIST_acc",
+            "ChestMNIST_auc", "ChestMNIST_acc",
+            "DermaMNIST_auc", "DermaMNIST_acc",
+            "alpha_entropy",  "tau",
+        ])
+
+    # ── Best-accuracy checkpoint tracking (per task, updated every epoch) ────
+    best_acc_per_task: Dict[int, float] = {0: -1.0, 1: -1.0, 2: -1.0}
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader_bilevel, eval_loader = build_dataloaders(
@@ -224,6 +232,22 @@ def run_search(
             )
         controller.save_checkpoint(epoch, ckpt_dir=ckpt_dir, tag="latest")
 
+        # ── Best-accuracy checkpoint: save every epoch if any task improves ──
+        if eval_results is not None:
+            for _k, _metrics in eval_results.items():
+                _task_acc = _metrics.get("acc", 0.0)
+                if _task_acc > best_acc_per_task[_k]:
+                    best_acc_per_task[_k] = _task_acc
+                    _tname = MedMNISTDataset.TASK_NAMES.get(_k, f"task{_k}")
+                    controller.save_checkpoint(
+                        epoch, ckpt_dir=ckpt_dir,
+                        tag=f"best_acc_{_tname.lower()}"
+                    )
+                    logger.info(
+                        f"  [best-acc] {_tname} ACC={_task_acc:.4f}"
+                        f"  → saved best_acc_{_tname.lower()}.pt"
+                    )
+
         # Track best alpha state at peak mean AUC + rewind + patience
         if eval_results is not None:
             mean_auc = sum(
@@ -284,18 +308,50 @@ def run_search(
             f"  Mean alpha entropy: {ent:.4f} (threshold={entropy_threshold})"
         )
 
-        # ── Write training curves to CSV (Fix 2+5) ───────────────────────────
+        # ── Write training curves to CSV (AUC + ACC per task) ────────────────
         if eval_results is not None:
             with open(csv_path, "a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     epoch,
                     f"{eval_results.get(0, {}).get('auc', float('nan')):.4f}",
+                    f"{eval_results.get(0, {}).get('acc', float('nan')):.4f}",
                     f"{eval_results.get(1, {}).get('auc', float('nan')):.4f}",
+                    f"{eval_results.get(1, {}).get('acc', float('nan')):.4f}",
                     f"{eval_results.get(2, {}).get('auc', float('nan')):.4f}",
+                    f"{eval_results.get(2, {}).get('acc', float('nan')):.4f}",
                     f"{ent:.6f}",
                     f"{controller._current_tau:.4f}",
                 ])
+
+        # ── Per-task architecture snapshot every eval epoch ──────────────────
+        if eval_results is not None:
+            epoch_arch_path = os.path.join(
+                save_dir, f"architecture_epoch{epoch:03d}.txt"
+            )
+            with open(epoch_arch_path, "w") as _af:
+                from src.normalizers import annealed_sparsemax as _sp_ep
+                _soft_ep = _sp_ep(
+                    model.alphas.detach(), tau=controller._current_tau
+                )
+                for _t in range(model.num_tasks):
+                    _tname2 = MedMNISTDataset.TASK_NAMES.get(_t, f"Task{_t}")
+                    _best_ops = model.alphas[_t].argmax(dim=-1).tolist()
+                    _arch_ops = [OP_NAMES[i] for i in _best_ops]
+                    _t_auc = eval_results.get(_t, {}).get("auc", float("nan"))
+                    _t_acc = eval_results.get(_t, {}).get("acc", float("nan"))
+                    _af.write(
+                        f"{_tname2}: {_arch_ops}"
+                        f"  AUC={_t_auc:.4f}  ACC={_t_acc:.4f}\n"
+                    )
+                    for _lay in range(model.num_layers):
+                        _probs = _soft_ep[_t, _lay].tolist()
+                        _bar = "  ".join(
+                            f"{OP_NAMES[i][:10]:10s}={p:.3f}"
+                            for i, p in enumerate(_probs)
+                        )
+                        _af.write(f"  Layer {_lay}: {_bar}\n")
+                    _af.write("\n")
 
         if ent < entropy_threshold:
             logger.info(
