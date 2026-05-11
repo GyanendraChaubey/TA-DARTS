@@ -24,15 +24,6 @@ from .supernet import TaskAwareSupernet
 
 logger = logging.getLogger("MT-DARTS")
 
-# ── DermaMNIST class prior (train split counts from MedMNIST v2) ──────────────
-# Dividing softmax probabilities by this prior at eval time removes the
-# majority-class bias and prevents the model from always predicting class 5
-# (melanocytic nevi, ~67% of samples).  Applied only during ACC computation;
-# AUC uses the raw softmax scores unchanged (prior-corrected scores are stored
-# separately for ACC, raw scores remain in y_score for AUC).
-_DERMA_CLASS_COUNTS = np.array([327.0, 514.0, 1099.0, 115.0, 1113.0, 6705.0, 142.0])
-_DERMA_CLASS_PRIOR  = _DERMA_CLASS_COUNTS / _DERMA_CLASS_COUNTS.sum()  # shape (7,)
-
 # ── Optional sklearn ──────────────────────────────────────────────────────────
 try:
     from sklearn.metrics import roc_auc_score
@@ -165,11 +156,20 @@ def evaluate_task(
     else:
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
         if task_id == 2:
-            # Prior-probability correction for DermaMNIST: dividing by the
-            # class prior removes the learned majority-class bias so argmax
-            # reflects discriminative signal rather than dataset frequency.
-            # AUC is unaffected — it uses the raw y_score below.
-            y_score_corrected = y_score / (_DERMA_CLASS_PRIOR + 1e-8)
+            # Empirical prior-probability correction for DermaMNIST.
+            # Using y_true from this split (not hardcoded counts) makes
+            # the correction robust to both real data AND synthetic/mock
+            # data where the hardcoded 67%-class-5 prior would massively
+            # amplify rare-class scores and crash ACC to ~0.
+            _n_cls  = MedMNISTDataset.NUM_CLASSES[2]  # 7
+            _counts = np.bincount(
+                y_true_flat.astype(int), minlength=_n_cls
+            ).astype(np.float64)
+            _prior  = _counts / (_counts.sum() + 1e-8)
+            # Floor at 1e-3: prevents ×1000+ amplification when a class
+            # is absent from this split (can happen in small val batches).
+            _prior  = np.maximum(_prior, 1e-3)
+            y_score_corrected = y_score / _prior
             y_pred = np.argmax(y_score_corrected, axis=-1)
         else:
             y_pred = np.argmax(y_score, axis=-1)
@@ -329,7 +329,13 @@ def evaluate_task_tta(
     else:
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
         if task_id == 2:
-            y_score_corrected = y_score / (_DERMA_CLASS_PRIOR + 1e-8)
+            _n_cls  = MedMNISTDataset.NUM_CLASSES[2]
+            _counts = np.bincount(
+                y_true_flat.astype(int), minlength=_n_cls
+            ).astype(np.float64)
+            _prior  = _counts / (_counts.sum() + 1e-8)
+            _prior  = np.maximum(_prior, 1e-3)
+            y_score_corrected = y_score / _prior
             y_pred = np.argmax(y_score_corrected, axis=-1)
         else:
             y_pred = np.argmax(y_score, axis=-1)
