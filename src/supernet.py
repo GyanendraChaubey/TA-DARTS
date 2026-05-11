@@ -56,41 +56,68 @@ class TaskAwareSupernet(nn.Module):
         )
         self.num_classes = num_classes_per_task
 
-        # Adaptive stem: 64×64 → 16×16 via two stride-2 convs (efficiency).
-        # Falls back to a single conv for 28×28 (smoke-test compat).
-        if img_size > 32:
-            self.stem = nn.Sequential(
-                nn.Conv2d(3, channels // 2, 3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(channels // 2),
-                nn.ReLU6(inplace=True),
-                nn.Conv2d(channels // 2, channels, 3, stride=2, padding=1,
-                          bias=False),
-                nn.BatchNorm2d(channels),
-                nn.ReLU6(inplace=True),
-            )
-        else:
-            self.stem = nn.Sequential(
-                nn.Conv2d(3, channels, 3, padding=1, bias=False),
-                nn.BatchNorm2d(channels),
-                nn.ReLU6(inplace=True),
-            )
+        # ── Per-task adaptive stems ────────────────────────────────────────
+        # Each task gets its own private stem rather than sharing one.
+        # Gradient disentanglement (Contrib. [A]) applies at the cell level;
+        # independent stems let each task learn its own low-level feature
+        # extractor without cross-task interference at the pixel level.
+        def _make_stem() -> nn.Sequential:
+            if img_size > 32:
+                return nn.Sequential(
+                    nn.Conv2d(3, channels // 2, 3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(channels // 2),
+                    nn.ReLU6(inplace=True),
+                    nn.Conv2d(channels // 2, channels, 3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU6(inplace=True),
+                )
+            else:
+                return nn.Sequential(
+                    nn.Conv2d(3, channels, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU6(inplace=True),
+                )
+
+        self.stems = nn.ModuleList([_make_stem() for _ in range(num_tasks)])
+
         self.cells = nn.ModuleList(
             [MixedOp(channels) for _ in range(num_layers)]
         )
-        # Deeper heads: GAP → Dropout(0.3) → FC(4C) → ReLU → Dropout(0.2) → FC(nc)
+
+        # ── Task-specific classification heads ────────────────────────────
+        # PathMNIST / ChestMNIST: GAP → Dropout(0.3) → FC(4C) → ReLU → Dropout(0.2) → FC(nc)
+        # DermaMNIST (task 2): deeper head with BN + extra hidden layer to
+        #   improve calibration on the 7-class imbalanced 10k dataset.
         hidden_dim = max(channels * 4, 256)
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Dropout(p=0.3),
-                nn.Linear(channels, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(p=0.2),
-                nn.Linear(hidden_dim, nc),
-            )
-            for nc in num_classes_per_task
-        ])
+        heads: list = []
+        for t, nc in enumerate(num_classes_per_task):
+            if t == 2:
+                # Deeper head: GAP → D(0.3) → FC(4C) → BN → ReLU → D(0.2) → FC(2C) → ReLU → D(0.1) → FC(7)
+                hidden2 = max(channels * 2, 128)
+                heads.append(nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Flatten(),
+                    nn.Dropout(p=0.3),
+                    nn.Linear(channels, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=0.2),
+                    nn.Linear(hidden_dim, hidden2),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=0.1),
+                    nn.Linear(hidden2, nc),
+                ))
+            else:
+                heads.append(nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Flatten(),
+                    nn.Dropout(p=0.3),
+                    nn.Linear(channels, hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=0.2),
+                    nn.Linear(hidden_dim, nc),
+                ))
+        self.heads = nn.ModuleList(heads)
 
         # Architecture parameters — shape (T, L, O).
         # Near-zero init → sparsemax starts close to uniform distribution.
@@ -135,7 +162,7 @@ class TaskAwareSupernet(nn.Module):
         task_alphas       = self.alphas[task_id]                      # (L, O)
         weights_per_layer = annealed_sparsemax(task_alphas, tau=tau)  # (L, O)
 
-        x = self.stem(x)
+        x = self.stems[task_id](x)
         for i, cell in enumerate(self.cells):
             x = cell(x, weights_per_layer[i])
         return self.heads[task_id](x)
@@ -165,7 +192,7 @@ class TaskAwareSupernet(nn.Module):
             for l, idx in enumerate(best_indices)
         ]
         discrete = nn.Sequential(
-            copy.deepcopy(self.stem),
+            copy.deepcopy(self.stems[task_id]),
             *chosen,
             copy.deepcopy(self.heads[task_id]),
         )

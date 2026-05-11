@@ -19,6 +19,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from src.controller import SearchController
@@ -42,26 +43,26 @@ def run_search(
     # ── Search ──────────────────────────────────────────────────────────────
     num_epochs:        int   = 50,
     batch_size:        int   = 64,
-    num_layers:        int   = 6,
-    channels:          int   = 32,
+    num_layers:        int   = 8,
+    channels:          int   = 64,
     lr_weights:        float = 0.025,
-    lr_alphas:         float = 3e-4,
+    lr_alphas:         float = 1e-4,
     log_interval:      int   = 25,
     eval_interval:     int   = 1,
     ckpt_interval:     int   = 5,
     # ── Retrain ─────────────────────────────────────────────────────────────
-    retrain_epochs:    int   = 100,
+    retrain_epochs:    int   = 200,
     retrain_lr:        float = 0.025,
     # ── Contrib. [B] temperature annealing ──────────────────────────────────
     tau_init:          float = 1.5,
-    anneal_factor:     float = 0.85,
-    anneal_interval:   int   = 10,
-    tau_min:           float = 0.1,
+    anneal_factor:     float = 0.90,
+    anneal_interval:   int   = 3,
+    tau_min:           float = 0.30,
     # ── Contrib. [C] delayed alpha updates ───────────────────────────────────
     alpha_update_freq: int   = 10,
     # ── Contrib. [D] early stopping ──────────────────────────────────────────
     entropy_threshold: float = 0.05,
-    auc_patience:      int   = 10,
+    auc_patience:      int   = 15,
     rewind_thresh:     float = 0.10,
     # ── Infrastructure ──────────────────────────────────────────────────────
     ckpt_dir:          str          = "checkpoints",
@@ -75,6 +76,7 @@ def run_search(
     mixup_alpha:       float        = 0.2,
     label_smoothing:   float        = 0.1,
     search_micro_batch:int          = 0,
+    use_tta:           bool         = False,
 ) -> Dict[str, Any]:
     """
     Execute the full MT-DARTS v2 pipeline and return benchmark results.
@@ -471,6 +473,7 @@ def run_search(
             save_dir=save_dir,
             mixup_alpha=mixup_alpha,
             label_smoothing=label_smoothing,
+            use_tta=use_tta,
         )
         result["architecture"] = architectures[k]
         benchmark_results[k]   = result
@@ -487,12 +490,21 @@ def run_search(
     logger.info("\n▶ PHASE D: Benchmark Report")
     table = print_benchmark_table(benchmark_results, architectures)
 
+    # Compute search efficiency: mean test AUC per GPU-hour of search.
+    _mean_auc = float(np.mean([
+        r.get("test_auc", 0.0) for r in benchmark_results.values()
+    ])) if benchmark_results else 0.0
+    _search_hours = search_time / 3600.0
+    search_efficiency = _mean_auc / _search_hours if _search_hours > 0 else float("inf")
+    logger.info(f"  Search efficiency: {search_efficiency:.4f} AUC/hour")
+
     save_benchmark_results(
         benchmark_results,
         architectures,
         search_time_s=search_time,
         retrain_time_s=retrain_time,
         save_dir=save_dir,
+        search_efficiency=search_efficiency,
     )
 
     table_path = os.path.join(save_dir, "benchmark_table.txt")
@@ -500,8 +512,9 @@ def run_search(
         fh.write(table + "\n")
 
     return {
-        "results":       benchmark_results,
-        "architectures": architectures,
-        "search_time":   search_time,
-        "retrain_time":  retrain_time,
+        "results":           benchmark_results,
+        "architectures":     architectures,
+        "search_time":       search_time,
+        "retrain_time":      retrain_time,
+        "search_efficiency": search_efficiency,
     }

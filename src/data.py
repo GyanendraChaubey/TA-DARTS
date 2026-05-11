@@ -13,7 +13,7 @@ from typing import List, Tuple
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 # ── Per-task normalisation stats ──────────────────────────────────────────────
 # Replace with dataset-specific values computed from real MedMNIST splits.
@@ -217,6 +217,63 @@ class MedMNISTDataset(Dataset):
         images_t   = torch.stack(images)
         task_ids_t = torch.tensor(task_ids, dtype=torch.long)
         return images_t, list(labels), task_ids_t
+
+
+# ── Weighted sampler for imbalanced tasks ─────────────────────────────────────
+
+def build_weighted_sampler(
+    task_id: int,
+    dataset: "MedMNISTDataset",
+    oversample_factor: float = 2.0,
+) -> WeightedRandomSampler:
+    """
+    Build a WeightedRandomSampler that gives each class equal expected
+    frequency per epoch for the given task.
+
+    Only samples belonging to ``task_id`` are considered; other-task
+    samples receive weight 0 so they are never drawn.  The sampler
+    targets ``oversample_factor × n_task_samples`` draws per epoch,
+    which oversamples minority classes to compensate for imbalance.
+
+    Args:
+        task_id           : Task to balance (e.g. 2 = DermaMNIST).
+        dataset           : A MedMNISTDataset instance (any split).
+        oversample_factor : Multiplier on the number of task samples for
+                            the sampler length.  Default 2.0 doubles the
+                            effective epoch length for the task.
+
+    Returns:
+        WeightedRandomSampler ready to pass to DataLoader.
+    """
+    # Collect per-class counts for this task.
+    class_counts: dict = {}
+    task_indices: List[int] = []
+    for idx in range(len(dataset)):
+        if dataset.task_ids[idx] != task_id:
+            continue
+        lbl = dataset.labels[idx]
+        cls = int(lbl.item() if isinstance(lbl, Tensor) else lbl)
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+        task_indices.append(idx)
+
+    if not task_indices:
+        raise ValueError(
+            f"No samples found for task_id={task_id} in the dataset."
+        )
+
+    # Weight per sample = 1 / class_frequency (uniform class distribution).
+    sample_weights = torch.zeros(len(dataset), dtype=torch.float64)
+    for idx in task_indices:
+        lbl = dataset.labels[idx]
+        cls = int(lbl.item() if isinstance(lbl, Tensor) else lbl)
+        sample_weights[idx] = 1.0 / class_counts[cls]
+
+    num_samples = int(len(task_indices) * oversample_factor)
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=num_samples,
+        replacement=True,
+    )
 
 
 # ── DataLoader factory ────────────────────────────────────────────────────────

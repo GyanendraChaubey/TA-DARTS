@@ -25,10 +25,13 @@ def print_benchmark_table(
 
     Returns the formatted table string (also printed to stdout).
     """
-    sep    = "═" * 72
+    # ResNet-18 baseline for normalisation (11.2M as published in MedMNIST v2)
+    RESNET18_PARAMS = 11_200_000
+
+    sep    = "═" * 84
     header = (
         f"{'Task':<14s} │ {'ACC (%)':>8s} │ {'AUC':>8s} │ "
-        f"{'Params':>10s} │ Architecture"
+        f"{'Params':>10s} │ {'vs RN18':>8s} │ Architecture"
     )
     lines = [
         "",
@@ -36,7 +39,7 @@ def print_benchmark_table(
         "  MT-DARTS v2 — Benchmark Results on MedMNIST",
         sep,
         header,
-        "─" * 72,
+        "─" * 84,
     ]
 
     accs: List[float] = []
@@ -48,6 +51,7 @@ def print_benchmark_table(
         acc_pct     = r["test_acc"] * 100
         auc_val     = r["test_auc"]
         params      = r["n_params"]
+        ratio_pct   = 100.0 * params / RESNET18_PARAMS
         arch        = architectures.get(task_id, [])
         op_counts   = Counter(arch)
         arch_summary = ", ".join(
@@ -55,15 +59,15 @@ def print_benchmark_table(
         )
         lines.append(
             f"  {name:<12s} │ {acc_pct:>7.2f}% │ {auc_val:>8.4f} │ "
-            f"{params:>10,d} │ {arch_summary}"
+            f"{params:>10,d} │ {ratio_pct:>7.1f}% │ {arch_summary}"
         )
         accs.append(acc_pct)
         aucs.append(auc_val)
 
-    lines.append("─" * 72)
+    lines.append("─" * 84)
     lines.append(
         f"  {'Macro Avg':<12s} │ {float(np.mean(accs)):>7.2f}% │ "
-        f"{float(np.mean(aucs)):>8.4f} │ {'—':>10s} │"
+        f"{float(np.mean(aucs)):>8.4f} │ {'—':>10s} │ {'—':>8s} │"
     )
     lines.append(sep)
 
@@ -73,25 +77,30 @@ def print_benchmark_table(
 
 
 def save_benchmark_results(
-    results:        Dict[int, Dict[str, Any]],
-    architectures:  Dict[int, List[str]],
-    search_time_s:  float,
-    retrain_time_s: float,
-    save_dir:       str,
+    results:          Dict[int, Dict[str, Any]],
+    architectures:    Dict[int, List[str]],
+    search_time_s:    float,
+    retrain_time_s:   float,
+    save_dir:         str,
+    search_efficiency: float = 0.0,
 ) -> None:
     """
     Persist benchmark results as ``{save_dir}/benchmark_results.json``.
     """
+    RESNET18_PARAMS = 11_200_000
     output: Dict[str, Any] = {
         "search_time_seconds":  search_time_s,
         "retrain_time_seconds": retrain_time_s,
+        "search_efficiency_auc_per_hour": search_efficiency,
         "tasks": {},
     }
     for task_id in sorted(results.keys()):
         name = MedMNISTDataset.TASK_NAMES[task_id]
+        n_params = results[task_id].get("n_params", 0)
         output["tasks"][name] = {
             **results[task_id],
             "architecture": architectures.get(task_id, []),
+            "params_vs_resnet18_pct": round(100.0 * n_params / RESNET18_PARAMS, 2),
         }
 
     accs = [r["test_acc"] for r in results.values()]

@@ -24,6 +24,15 @@ from .supernet import TaskAwareSupernet
 
 logger = logging.getLogger("MT-DARTS")
 
+# ── DermaMNIST class prior (train split counts from MedMNIST v2) ──────────────
+# Dividing softmax probabilities by this prior at eval time removes the
+# majority-class bias and prevents the model from always predicting class 5
+# (melanocytic nevi, ~67% of samples).  Applied only during ACC computation;
+# AUC uses the raw softmax scores unchanged (prior-corrected scores are stored
+# separately for ACC, raw scores remain in y_score for AUC).
+_DERMA_CLASS_COUNTS = np.array([327.0, 514.0, 1099.0, 115.0, 1113.0, 6705.0, 142.0])
+_DERMA_CLASS_PRIOR  = _DERMA_CLASS_COUNTS / _DERMA_CLASS_COUNTS.sum()  # shape (7,)
+
 # ── Optional sklearn ──────────────────────────────────────────────────────────
 try:
     from sklearn.metrics import roc_auc_score
@@ -154,8 +163,16 @@ def evaluate_task(
             y_pred = (y_score >= 0.5).astype(np.float32)
         acc    = float(np.mean(y_pred == y_true))
     else:
-        y_pred      = np.argmax(y_score, axis=-1)
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
+        if task_id == 2:
+            # Prior-probability correction for DermaMNIST: dividing by the
+            # class prior removes the learned majority-class bias so argmax
+            # reflects discriminative signal rather than dataset frequency.
+            # AUC is unaffected — it uses the raw y_score below.
+            y_score_corrected = y_score / (_DERMA_CLASS_PRIOR + 1e-8)
+            y_pred = np.argmax(y_score_corrected, axis=-1)
+        else:
+            y_pred = np.argmax(y_score, axis=-1)
         acc         = float(np.mean(y_pred == y_true_flat))
 
     auc = _safe_auc(y_true, y_score, is_ml, n_classes)
@@ -191,6 +208,136 @@ def evaluate(
         )
         results[k] = metrics
     return results
+
+
+# ── Test-time augmentation evaluation ────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate_task_tta(
+    model:            nn.Module,
+    loader:           DataLoader,
+    task_id:          int,
+    device:           torch.device,
+    is_supernet:      bool                    = False,
+    n_tta:            int                     = 8,
+    chest_thresholds: "Optional[np.ndarray]"  = None,
+) -> Dict[str, float]:
+    """
+    Evaluate ``model`` with test-time augmentation (TTA).
+
+    Produces ``n_tta`` augmented views of each image (horizontal flips +
+    random crops) and averages the softmax/sigmoid scores.  Averaged scores
+    are then passed through the same ACC and AUC computation as
+    :func:`evaluate_task`, including the DermaMNIST prior correction.
+
+    Args:
+        model            : Discrete model (is_supernet=False) or supernet.
+        loader           : Mixed-task DataLoader.
+        task_id          : Which task to filter and evaluate.
+        device           : Compute device.
+        is_supernet      : If True call model(imgs, task_id); else model(imgs).
+        n_tta            : Number of augmented views to average (default 8).
+        chest_thresholds : Optional per-label thresholds for ChestMNIST ACC.
+
+    Returns:
+        {"acc": float, "auc": float, "loss": float, "n": int}
+    """
+    import torchvision.transforms.functional as TF
+
+    model.eval()
+    is_ml     = task_id in TaskAwareSupernet.MULTILABEL_TASKS
+    n_classes = MedMNISTDataset.NUM_CLASSES[task_id]
+
+    all_scores: List[np.ndarray] = []
+    all_labels: List[np.ndarray] = []
+    total_loss = 0.0
+    n_batches  = 0
+
+    for images, labels, task_ids in loader:
+        images     = images.to(device)
+        task_ids_t = task_ids.to(device)
+        mask       = (task_ids_t == task_id)
+        if not mask.any():
+            continue
+
+        imgs_k   = images[mask]
+        labels_k = [labels[i]
+                    for i in mask.nonzero(as_tuple=True)[0].tolist()]
+
+        # Build augmented views and average their predictions.
+        acc_logits = torch.zeros(
+            imgs_k.size(0), n_classes, device=device, dtype=torch.float32,
+        )
+        for view_idx in range(n_tta):
+            aug = imgs_k.clone()
+            # Horizontal flip for odd views.
+            if view_idx % 2 == 1:
+                aug = TF.hflip(aug)
+            # Four-corner + centre crops: views 0–4 are corners+centre,
+            # repeated with flip for views 5–9.
+            _, _, h, w = aug.shape
+            crop_size  = int(min(h, w) * 0.9)
+            pad        = (min(h, w) - crop_size) // 2
+            cx = [0, w - crop_size, 0, w - crop_size, pad][view_idx % 5]
+            cy = [0, 0, h - crop_size, h - crop_size, pad][view_idx % 5]
+            aug = aug[:, :, cy:cy + crop_size, cx:cx + crop_size]
+            aug = torch.nn.functional.interpolate(
+                aug, size=(h, w), mode="bilinear", align_corners=False,
+            )
+            logits = model(aug, task_id) if is_supernet else model(aug)
+            if is_ml:
+                acc_logits += torch.sigmoid(logits)
+            else:
+                acc_logits += F.softmax(logits, dim=-1)
+
+        avg_scores = (acc_logits / n_tta).cpu().numpy()
+
+        # Compute loss on the original (non-augmented) images for reference.
+        orig_logits = model(imgs_k, task_id) if is_supernet else model(imgs_k)
+        loss = task_loss(orig_logits, labels_k, task_id, device)
+        total_loss += loss.item()
+        n_batches  += 1
+
+        if is_ml:
+            lbl_np = torch.stack(
+                [l if isinstance(l, Tensor) else torch.tensor(l)
+                 for l in labels_k]
+            ).numpy()
+        else:
+            lbl_np = np.array(
+                [l.item() if isinstance(l, Tensor) else l for l in labels_k]
+            )
+        all_scores.append(avg_scores)
+        all_labels.append(lbl_np)
+
+    model.train()
+
+    if n_batches == 0:
+        return {"acc": 0.0, "auc": float("nan"), "loss": 0.0, "n": 0}
+
+    y_score  = np.concatenate(all_scores, axis=0)
+    y_true   = np.concatenate(all_labels, axis=0)
+    avg_loss = total_loss / n_batches
+
+    if is_ml:
+        if chest_thresholds is not None:
+            thr    = chest_thresholds[np.newaxis, :]
+            y_pred = (y_score >= thr).astype(np.float32)
+        else:
+            y_pred = (y_score >= 0.5).astype(np.float32)
+        acc = float(np.mean(y_pred == y_true))
+    else:
+        y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
+        if task_id == 2:
+            y_score_corrected = y_score / (_DERMA_CLASS_PRIOR + 1e-8)
+            y_pred = np.argmax(y_score_corrected, axis=-1)
+        else:
+            y_pred = np.argmax(y_score, axis=-1)
+        acc = float(np.mean(y_pred == y_true_flat))
+
+    auc = _safe_auc(y_true, y_score, is_ml, n_classes)
+    return {"acc": acc, "auc": auc, "loss": float(avg_loss),
+            "n": int(y_true.shape[0])}
 
 
 # ── Alpha entropy (early stopping signal) ────────────────────────────────────

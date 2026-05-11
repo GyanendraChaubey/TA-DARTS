@@ -15,13 +15,15 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .data import MedMNISTDataset
+import numpy as np
+from torch.utils.data import DataLoader as _DL, WeightedRandomSampler
+
+from .data import MedMNISTDataset, build_weighted_sampler
 from .losses import task_loss
 from .metrics import evaluate_task
 from .supernet import TaskAwareSupernet
@@ -85,6 +87,36 @@ def _calibrate_chest_thresholds(
     return best_thresholds
 
 
+def _cutmix_batch(
+    images: torch.Tensor,
+    labels: list,
+    alpha: float = 1.0,
+):
+    """
+    CutMix augmentation (Yun et al., 2019).
+    Returns (mixed_images, labels_a, labels_b, lam).
+    ``lam`` is the recomputed pixel-area ratio after clipping the bounding box.
+    """
+    lam_beta = float(np.random.beta(alpha, alpha))
+    lam_beta = max(lam_beta, 1.0 - lam_beta)   # keep dominant sample
+    b, c, h, w = images.shape
+    shuf = torch.randperm(b)
+    cut_ratio = np.sqrt(1.0 - lam_beta)
+    cut_h = max(1, int(h * cut_ratio))
+    cut_w = max(1, int(w * cut_ratio))
+    cx = np.random.randint(w)
+    cy = np.random.randint(h)
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, w)
+    y2 = min(cy + cut_h // 2, h)
+    mixed = images.clone()
+    mixed[:, :, y1:y2, x1:x2] = images[shuf, :, y1:y2, x1:x2]
+    lam = 1.0 - float((x2 - x1) * (y2 - y1)) / float(h * w)
+    labels_b = [labels[i] for i in shuf.tolist()]
+    return mixed, labels, labels_b, lam
+
+
 def _reinit_weights(model: nn.Module) -> None:
     """Re-initialise all learnable tensors from scratch (DARTS convention)."""
     for m in model.modules():
@@ -105,43 +137,50 @@ def _reinit_weights(model: nn.Module) -> None:
 
 
 def retrain_discrete(
-    discrete_model: nn.Module,
-    task_id:        int,
-    train_loader:   DataLoader,
-    val_loader:     DataLoader,
-    test_loader:    DataLoader,
-    num_epochs:     int              = 200,
-    lr:             float            = 0.025,
-    weight_decay:   float            = 3e-4,
-    grad_clip:      float            = 5.0,
-    device:         torch.device     = torch.device("cpu"),
-    save_dir:       Optional[str]    = None,
-    mixup_alpha:    float            = 0.2,
-    label_smoothing: float           = 0.1,
+    discrete_model:       nn.Module,
+    task_id:              int,
+    train_loader:         DataLoader,
+    val_loader:           DataLoader,
+    test_loader:          DataLoader,
+    num_epochs:           int              = 200,
+    lr:                   float            = 0.025,
+    weight_decay:         float            = 3e-4,
+    grad_clip:            float            = 5.0,
+    device:               torch.device     = torch.device("cpu"),
+    save_dir:             Optional[str]    = None,
+    mixup_alpha:          float            = 0.2,
+    label_smoothing:      float            = 0.1,
+    use_weighted_sampler: bool             = True,
+    use_tta:              bool             = False,
 ) -> Dict[str, Any]:
     """
     Retrain a discrete architecture from random initialisation.
 
     Improvements over baseline:
-      - Mixup augmentation (alpha=0.2) for better generalisation.
-      - Linear LR warmup then CosineAnnealingLR.
+      - Mixup + CutMix augmentation (50/50 random choice) for DermaMNIST.
+      - WeightedRandomSampler for class-balanced batches on DermaMNIST.
+      - Linear LR warmup then CosineAnnealingLR (or WarmRestarts for DermaMNIST).
       - Label smoothing for CE tasks (PathMNIST, DermaMNIST).
       - Val AUC checkpoint selection every epoch.
+      - Optional test-time augmentation (8-view ensemble) at final eval.
 
     Args:
-        discrete_model  : Output of :meth:`TaskAwareSupernet.discretize`.
-        task_id         : Task index (determines loss and dataset metadata).
-        train_loader    : Mixed-task training DataLoader.
-        val_loader      : Mixed-task validation DataLoader (best-model selection).
-        test_loader     : Mixed-task test DataLoader (final evaluation).
-        num_epochs      : Number of retraining epochs.
-        lr              : Initial SGD learning rate.
-        weight_decay    : L2 regularisation.
-        grad_clip       : Gradient clipping norm.
-        device          : Compute device.
-        save_dir        : If provided, saves the best checkpoint here.
-        mixup_alpha     : Beta distribution alpha for Mixup (0 = disabled).
-        label_smoothing : Label smoothing for CE tasks (0 = disabled).
+        discrete_model        : Output of :meth:`TaskAwareSupernet.discretize`.
+        task_id               : Task index (determines loss and dataset metadata).
+        train_loader          : Mixed-task training DataLoader.
+        val_loader            : Mixed-task validation DataLoader (best-model selection).
+        test_loader           : Mixed-task test DataLoader (final evaluation).
+        num_epochs            : Number of retraining epochs.
+        lr                    : Initial SGD learning rate.
+        weight_decay          : L2 regularisation.
+        grad_clip             : Gradient clipping norm.
+        device                : Compute device.
+        save_dir              : If provided, saves the best checkpoint here.
+        mixup_alpha           : Beta distribution alpha for Mixup (0 = disabled).
+        label_smoothing       : Label smoothing for CE tasks (0 = disabled).
+        use_weighted_sampler  : If True and task_id==2, build a class-balanced
+                                DataLoader for DermaMNIST retraining.
+        use_tta               : If True, use 8-view TTA for final test evaluation.
 
     Returns:
         {"test_acc", "test_auc", "test_loss", "best_val_auc", "n_params"}
@@ -156,6 +195,30 @@ def retrain_discrete(
     _reinit_weights(discrete_model)
     discrete_model = discrete_model.to(device)
 
+    # ── DermaMNIST: build class-balanced DataLoader ────────────────────────
+    # Wraps the underlying dataset in a WeightedRandomSampler so each class
+    # appears with equal expected frequency, addressing the 67% majority bias.
+    if task_id == 2 and use_weighted_sampler:
+        try:
+            sampler = build_weighted_sampler(
+                task_id=task_id,
+                dataset=train_loader.dataset,
+            )
+            active_train_loader = _DL(
+                train_loader.dataset,
+                batch_size=train_loader.batch_size or 64,
+                sampler=sampler,
+                num_workers=train_loader.num_workers,
+                collate_fn=train_loader.collate_fn,
+                pin_memory=train_loader.pin_memory,
+            )
+            logger.info("  [DermaMNIST] Using WeightedRandomSampler for class-balanced batches.")
+        except Exception as exc:
+            logger.warning(f"  [DermaMNIST] WeightedRandomSampler failed ({exc}); falling back to original loader.")
+            active_train_loader = train_loader
+    else:
+        active_train_loader = train_loader
+
     n_params = sum(p.numel() for p in discrete_model.parameters())
     logger.info(f"  Parameters: {n_params:,}")
 
@@ -167,20 +230,39 @@ def retrain_discrete(
         nesterov=True,
     )
 
-    # Warmup for first ~5% of epochs, then cosine anneal.
-    warmup_epochs = max(5, num_epochs // 20)
-    warmup_sched  = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0,
-        total_iters=warmup_epochs,
-    )
-    cosine_sched  = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-5,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_sched, cosine_sched],
-        milestones=[warmup_epochs],
-    )
+    # ── Learning-rate scheduler ────────────────────────────────────────────
+    # DermaMNIST: CosineAnnealingWarmRestarts after a short warmup.
+    #   Warm restarts help escape the narrow, imbalance-induced local minima
+    #   that a simple cosine anneal tends to get trapped in on the 7k set.
+    # PathMNIST / ChestMNIST: standard warmup → CosineAnnealingLR.
+    if task_id == 2:
+        warmup_epochs = 10
+        warmup_sched  = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        restart_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=50, T_mult=2, eta_min=1e-5,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_sched, restart_sched],
+            milestones=[warmup_epochs],
+        )
+    else:
+        warmup_epochs = max(5, num_epochs // 20)
+        warmup_sched  = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_sched  = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-5,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_sched, cosine_sched],
+            milestones=[warmup_epochs],
+        )
 
     best_val_auc: float  = -1.0
     best_state           = None
@@ -194,7 +276,7 @@ def retrain_discrete(
         epoch_loss = 0.0
         n_batches  = 0
 
-        for images, labels, task_ids in train_loader:
+        for images, labels, task_ids in active_train_loader:
             mask = (task_ids == task_id)
             if not mask.any():
                 continue
@@ -203,14 +285,24 @@ def retrain_discrete(
             images_k = images[mask].to(device)
             labels_k = [labels[i] for i in idx_list]
 
-            # ── Mixup ────────────────────────────────────────────────────────
-            # DermaMNIST uses higher mixup alpha (0.4) for stronger
-            # regularisation on the small 7k training set.
+            # ── Augmentation ─────────────────────────────────────────────────
+            # DermaMNIST (task 2): 50/50 random choice of CutMix or Mixup.
+            #   CutMix preserves local textures; Mixup regularises globally.
+            #   Combined they improve calibration on the 7-class imbalanced set.
+            # Other tasks: standard Mixup only.
             effective_alpha = (mixup_alpha * 2.0) if (task_id == 2 and mixup_alpha > 0) else mixup_alpha
-            use_mixup = effective_alpha > 0.0 and images_k.size(0) >= 2
-            if use_mixup:
+            use_aug = effective_alpha > 0.0 and images_k.size(0) >= 2
+
+            if use_aug and task_id == 2 and np.random.rand() < 0.5:
+                # CutMix branch
+                images_k_mix, labels_k, labels_k_shuf, lam = _cutmix_batch(
+                    images_k, labels_k, alpha=effective_alpha,
+                )
+                images_k_mix = images_k_mix.to(device)
+            elif use_aug:
+                # Mixup branch
                 lam  = float(np.random.beta(effective_alpha, effective_alpha))
-                lam  = max(lam, 1.0 - lam)   # keep dominant sample
+                lam  = max(lam, 1.0 - lam)
                 shuf = torch.randperm(images_k.size(0), device=device)
                 images_k_mix   = lam * images_k + (1.0 - lam) * images_k[shuf]
                 labels_k_shuf  = [labels_k[i] for i in shuf.tolist()]
@@ -222,7 +314,7 @@ def retrain_discrete(
             optimizer.zero_grad()
             logits = discrete_model(images_k_mix)
 
-            if use_mixup and is_multilabel:
+            if use_aug and is_multilabel:
                 # Mix float multi-hot label vectors directly for BCE.
                 from .losses import _CHEST_POS_WEIGHT
                 lbl_a = torch.stack(labels_k).to(device)
@@ -231,7 +323,7 @@ def retrain_discrete(
                     logits, lam * lbl_a + (1.0 - lam) * lbl_b,
                     pos_weight=_CHEST_POS_WEIGHT.to(device),
                 )
-            elif use_mixup:
+            elif use_aug:
                 # Weighted sum of CE losses for the two mixed classes.
                 loss = (
                     lam * task_loss(logits, labels_k, task_id, device,
@@ -293,10 +385,17 @@ def retrain_discrete(
     else:
         chest_thresholds = None
 
-    test_metrics = evaluate_task(
-        discrete_model, test_loader, task_id, device, is_supernet=False,
-        chest_thresholds=chest_thresholds,
-    )
+    if use_tta:
+        from .metrics import evaluate_task_tta
+        test_metrics = evaluate_task_tta(
+            discrete_model, test_loader, task_id, device, is_supernet=False,
+            chest_thresholds=chest_thresholds,
+        )
+    else:
+        test_metrics = evaluate_task(
+            discrete_model, test_loader, task_id, device, is_supernet=False,
+            chest_thresholds=chest_thresholds,
+        )
     logger.info(
         f"  [{task_name}] FINAL TEST"
         f"  ACC={test_metrics['acc']:.4f}"
