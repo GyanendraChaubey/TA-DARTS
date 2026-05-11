@@ -155,20 +155,21 @@ def evaluate_task(
         acc    = float(np.mean(y_pred == y_true))
     else:
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
-        if task_id == 2:
-            # Empirical prior-probability correction for DermaMNIST.
-            # Using y_true from this split (not hardcoded counts) makes
-            # the correction robust to both real data AND synthetic/mock
-            # data where the hardcoded 67%-class-5 prior would massively
-            # amplify rare-class scores and crash ACC to ~0.
+        if task_id == 2 and not is_supernet:
+            # Prior-probability correction for DermaMNIST ACC.
+            # Only applied to a fully-trained discrete model (is_supernet=False).
+            # During search the supernet outputs near-uniform softmax; dividing
+            # by the skewed class prior (class 5 = 67%) amplifies random noise
+            # in rare classes by ×80 and crashes ACC to ~0.01.  The correction
+            # is only meaningful once the model has learned discriminative
+            # features (retrain phase).
             _n_cls  = MedMNISTDataset.NUM_CLASSES[2]  # 7
             _counts = np.bincount(
                 y_true_flat.astype(int), minlength=_n_cls
             ).astype(np.float64)
             _prior  = _counts / (_counts.sum() + 1e-8)
-            # Floor at 1e-3: prevents ×1000+ amplification when a class
-            # is absent from this split (can happen in small val batches).
-            _prior  = np.maximum(_prior, 1e-3)
+            # Floor at 1/n_classes so no class is amplified more than n_classes×.
+            _prior  = np.maximum(_prior, 1.0 / _n_cls)
             y_score_corrected = y_score / _prior
             y_pred = np.argmax(y_score_corrected, axis=-1)
         else:
@@ -328,13 +329,13 @@ def evaluate_task_tta(
         acc = float(np.mean(y_pred == y_true))
     else:
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
-        if task_id == 2:
+        if task_id == 2 and not is_supernet:
             _n_cls  = MedMNISTDataset.NUM_CLASSES[2]
             _counts = np.bincount(
                 y_true_flat.astype(int), minlength=_n_cls
             ).astype(np.float64)
             _prior  = _counts / (_counts.sum() + 1e-8)
-            _prior  = np.maximum(_prior, 1e-3)
+            _prior  = np.maximum(_prior, 1.0 / _n_cls)
             y_score_corrected = y_score / _prior
             y_pred = np.argmax(y_score_corrected, axis=-1)
         else:
