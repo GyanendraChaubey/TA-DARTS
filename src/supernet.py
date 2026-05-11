@@ -92,14 +92,18 @@ class TaskAwareSupernet(nn.Module):
         heads: list = []
         for t, nc in enumerate(num_classes_per_task):
             if t == 2:
-                # Deeper head: GAP → D(0.3) → FC(4C) → BN → ReLU → D(0.2) → FC(2C) → ReLU → D(0.1) → FC(7)
+                # Deeper head: GAP → D(0.3) → FC(4C) → LN → ReLU → D(0.2) → FC(2C) → ReLU → D(0.1) → FC(7)
+                # LayerNorm instead of BatchNorm1d: BN crashes on single-sample
+                # micro-batches (common when task_id==2 has 1 DermaMNIST image
+                # in a given batch).  LN normalises per-feature and works with
+                # any batch size.
                 hidden2 = max(channels * 2, 128)
                 heads.append(nn.Sequential(
                     nn.AdaptiveAvgPool2d(1),
                     nn.Flatten(),
                     nn.Dropout(p=0.3),
                     nn.Linear(channels, hidden_dim),
-                    nn.BatchNorm1d(hidden_dim),
+                    nn.LayerNorm(hidden_dim),
                     nn.ReLU(inplace=True),
                     nn.Dropout(p=0.2),
                     nn.Linear(hidden_dim, hidden2),
