@@ -276,7 +276,74 @@ def build_weighted_sampler(
     )
 
 
+def compute_chest_pos_weights(
+    dataset:    "MedMNISTDataset",
+    max_weight: float = 50.0,
+) -> "torch.Tensor":
+    """
+    Compute per-label BCEWithLogitsLoss ``pos_weight`` for ChestMNIST (task 1).
+
+    pos_weight[i] = n_negative[i] / n_positive[i], clipped at ``max_weight``.
+
+    The static fallback ``_CHEST_POS_WEIGHT = 10×1`` is a rough approximation.
+    ChestMNIST's 14 disease labels have prevalence ranging from ~0.2% (Hernia)
+    to ~19% (Infiltration), so per-label weights derived from the actual training
+    split are far more accurate and improve AUC on rare disease labels.
+
+    Falls back to the static weights if no ChestMNIST samples are found
+    (e.g., when using mock data).
+    """
+    from .losses import _CHEST_POS_WEIGHT  # avoid circular import at module level
+
+    n_labels   = MedMNISTDataset.NUM_CLASSES[1]  # 14
+    pos_counts = torch.zeros(n_labels, dtype=torch.float64)
+    total      = 0
+
+    for idx in range(len(dataset)):
+        if dataset.task_ids[idx] != 1:
+            continue
+        lbl = dataset.labels[idx]
+        if isinstance(lbl, Tensor):
+            pos_counts += lbl.double()
+        else:
+            pos_counts += torch.tensor(lbl, dtype=torch.float64)
+        total += 1
+
+    if total == 0 or pos_counts.sum() == 0:
+        return _CHEST_POS_WEIGHT.clone()   # fallback: no real ChestMNIST data
+
+    neg_counts = float(total) - pos_counts
+    pw = (neg_counts / pos_counts.clamp(min=1.0)).clamp(max=max_weight)
+    return pw.float()
+
+
 # ── DataLoader factory ────────────────────────────────────────────────────────
+
+def _build_task_balanced_sampler(dataset: "MedMNISTDataset") -> WeightedRandomSampler:
+    """
+    Build a WeightedRandomSampler that gives each *task* equal expected
+    frequency per epoch.
+
+    Without balancing, DermaMNIST (~7k samples) is only ~4% of the
+    combined 175k-sample train set, so each batch of 64 contains on
+    average only ~2.5 DermaMNIST images — severely limiting what the
+    architecture search can learn for that task.  This sampler ensures
+    each task contributes equally to every mini-batch.
+    """
+    task_counts: dict = {}
+    for tid in dataset.task_ids:
+        task_counts[tid] = task_counts.get(tid, 0) + 1
+
+    sample_weights = torch.zeros(len(dataset), dtype=torch.float64)
+    for idx, tid in enumerate(dataset.task_ids):
+        sample_weights[idx] = 1.0 / task_counts[tid]
+
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(dataset),
+        replacement=True,
+    )
+
 
 def build_dataloaders(
     batch_size:    int  = 64,
@@ -284,13 +351,20 @@ def build_dataloaders(
     use_real_data: bool = True,
     seed:          int  = 42,
     img_size:      int  = 64,
+    balance_tasks: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Construct and return ``(train_loader, val_bilevel_loader, eval_loader)``.
 
-    - ``train_loader``        — shuffled, drop_last=True  (weight updates).
+    - ``train_loader``        — task-balanced sampler (balance_tasks=True) or
+                                shuffled; drop_last=True  (weight updates).
     - ``val_bilevel_loader``  — shuffled, drop_last=True  (alpha updates).
     - ``eval_loader``         — no shuffle, drop_last=False (metric evaluation).
+
+    ``balance_tasks`` (default True) applies a task-balanced WeightedRandomSampler
+    to ``train_loader`` so each task (PathMNIST, ChestMNIST, DermaMNIST) has
+    equal expected frequency per batch, preventing the minority task DermaMNIST
+    from being starved during architecture search.
     """
     train_ds = MedMNISTDataset("train", num_mock_samples=1600,
                                seed=seed,     use_real=use_real_data,
@@ -305,10 +379,17 @@ def build_dataloaders(
     kw = dict(collate_fn=MedMNISTDataset.collate_fn, num_workers=num_workers,
               pin_memory=True)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        drop_last=True, **kw,
-    )
+    if balance_tasks:
+        task_sampler = _build_task_balanced_sampler(train_ds)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=task_sampler,
+            drop_last=True, **kw,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            drop_last=True, **kw,
+        )
     val_loader_bilevel = DataLoader(
         val_ds, batch_size=batch_size, shuffle=True,
         drop_last=True, **kw,

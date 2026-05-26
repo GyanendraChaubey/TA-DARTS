@@ -26,22 +26,25 @@ python main.py --no-real --epochs 2 --batch 32 --device cpu \
                --tau_min 0.25
 ```
 
-**Recommended run** (Kaggle GPU, ~7–8 hours total):
+**Recommended run** (Kaggle T4 GPU, benchmark-beating settings, ~5–7 hours):
 
 ```bash
 python main.py \
   --epochs 20 \
   --retrain_epochs 200 \
+  --channels 128 \
+  --layers 8 \
+  --batch 64 \
   --img-size 64 \
-  --anneal_factor 0.85 \
-  --anneal_interval 5 \
+  --tta \
+  --anneal_factor 0.80 \
+  --anneal_interval 3 \
   --tau_min 0.25 \
-  --batch 128 \
   --device cuda \
   --seed 42 \
   --save-dir /kaggle/working/results \
   --ckpt-dir /kaggle/working/checkpoints \
-  --workers 4
+  --workers 2
 ```
 
 ---
@@ -75,7 +78,7 @@ task-specific operation sequences within the shared feature extractor.
 **Annealed sparsemax.** Operation weights are computed as
 `sparsemax(alpha / tau)`. Unlike softmax, sparsemax produces exact zeros,
 so bad operations are completely suppressed. Temperature `tau` is annealed
-from 1.5 downwards with a configurable floor (`--tau_min`, default 0.1)
+from 1.5 downwards with a configurable floor (`--tau_min`, default 0.30)
 that prevents gradient collapse at low temperatures.
 
 **Best-alpha discretization.** During search, the alpha tensor is
@@ -83,13 +86,26 @@ snapshotted whenever mean AUC across all tasks improves. Phase B uses this
 best-AUC snapshot — not the final epoch — to choose operations. This makes
 the discovered architecture robust to late-search instability.
 
-**Task-balanced training.** Three sources of imbalance exist: dataset size
-(PathMNIST 89k vs DermaMNIST 7k), class frequency within each task, and
-loss-scale differences across task types (CE vs BCE). The system addresses
-all three: class-frequency weights in `losses.py`, and per-task gradient
-normalization in `SearchController` — each task's gradient is scaled to
-unit norm before being accumulated, so no single task dominates the shared
-weight update.
+**Task-balanced search batches.** DermaMNIST is only ~4% of the combined
+175k dataset, giving it ~2–3 images per batch of 64 without correction.
+`build_dataloaders` uses `WeightedRandomSampler` (task-level inverse
+frequency) to deliver ~21 images per task per batch, ensuring
+DermaMNIST meaningfully influences architecture parameters throughout search.
+
+**Imbalance-aware retraining.**
+- *DermaMNIST*: WeightedRandomSampler (class-balanced batches) + Focal Loss
+  (γ=2, concentrates gradients on hard examples) + 50%/50% CutMix/Mixup.
+  Class weights in the loss are disabled when the sampler is active to
+  avoid double-correcting the same imbalance.
+- *ChestMNIST*: per-label `pos_weight` computed from actual training
+  prevalence (label range 0.2%–19%), replacing the static ×10 fallback.
+- Per-task gradient normalisation in `SearchController` scales each task's
+  gradient to unit norm before accumulation, so no task dominates.
+
+**Stochastic Weight Averaging (SWA).** In the last 25% of retraining
+(or last 50 epochs), model weights are averaged rather than selecting a
+single best checkpoint. The averaged model sits in a flatter loss basin and
+generalises better — typical gain of 0.5–1.0% AUC at zero extra compute.
 
 ---
 
@@ -121,20 +137,23 @@ weight update.
 | Flag                | Default | Effect                                        |
 |---------------------|---------|-----------------------------------------------|
 | `--epochs`          | 50      | Search epochs                                 |
+| `--lr_a`            | 3e-4    | Alpha (architecture) learning rate            |
 | `--tau_init`        | 1.5     | Starting sparsemax temperature                |
-| `--anneal_factor`   | 0.85    | Temperature decay per interval                |
-| `--anneal_interval` | 10      | Epochs between decay steps                    |
-| `--tau_min`         | 0.1     | Temperature floor — prevents collapse         |
-| `--auc_patience`    | 10      | Early-stop if mean AUC stalls for N epochs    |
+| `--anneal_factor`   | 0.90    | Temperature decay per interval                |
+| `--anneal_interval` | 3       | Epochs between decay steps                    |
+| `--tau_min`         | 0.30    | Temperature floor — prevents collapse         |
+| `--auc_patience`    | 15      | Early-stop if mean AUC stalls for N epochs    |
 | `--rewind_thresh`   | 0.10    | Rewind alphas if AUC drops >10%               |
 | `--retrain_epochs`  | 200     | Max epochs for discrete model retraining      |
 | `--alpha_freq`      | 10      | Update alpha every N weight steps             |
-| `--entropy_thresh`  | 0.05    | Early-stop when architecture entropy < this  |
+| `--entropy_thresh`  | 0.05    | Early-stop when architecture entropy < this   |
+| `--tta`             | off     | 8-view test-time augmentation ensemble        |
+| `--channels`        | 64      | Feature channel width (128 recommended)       |
 
-> **Note on `--tau_min`:** with the old default `anneal_factor=0.75` and 60 search epochs,
-> tau decays to ~0.047 without a floor. Below ~0.2, sparsemax gradients
-> degrade and architecture weights collapse. Set `--tau_min 0.25` for runs
-> over 20 epochs.
+> **Note on `--tau_min`:** with `anneal_factor=0.75` over 60+ search epochs,
+> tau decays below 0.05 without a floor. Below ~0.2, sparsemax gradients
+> degrade and architecture weights collapse. The default 0.30 is safe for
+> 20-epoch searches; raise to 0.40 for searches over 50 epochs.
 
 ---
 
@@ -163,8 +182,8 @@ src/
   ops.py             10 candidate operations + MixedOp
   normalizers.py     sparsemax / annealed_sparsemax
   data.py            MedMNISTDataset + DataLoader builder
-  losses.py          CE (PathMNIST, DermaMNIST) / BCE (ChestMNIST)
-  retrain.py         Discrete model retraining with Mixup + warmup LR
+  losses.py          CE/Focal (PathMNIST/DermaMNIST) / BCE+per-label-weights (ChestMNIST)
+  retrain.py         Discrete model retraining with Mixup/CutMix, SWA, warm restarts
   metrics.py         ACC, AUC, alpha entropy
   reporting.py       ASCII table + JSON report writer
   utils.py           set_seed, _make_divisible

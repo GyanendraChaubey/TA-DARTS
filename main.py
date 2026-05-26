@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Feature map channel width")
     g.add_argument("--lr_w",            type=float, default=0.025,
                    help="Weight optimiser learning rate")
-    g.add_argument("--lr_a",            type=float, default=1e-4,
+    g.add_argument("--lr_a",            type=float, default=3e-4,
                    help="Alpha optimiser learning rate")
     g.add_argument("--log",             type=int,   default=25,
                    help="Log every N gradient steps")

@@ -48,7 +48,7 @@ class SearchController:
         model:             TaskAwareSupernet,
         epochs:            int,
         lr_weights:        float = 0.025,
-        lr_alphas:         float = 1e-4,
+        lr_alphas:         float = 3e-4,
         momentum:          float = 0.9,
         weight_decay_w:    float = 3e-4,
         weight_decay_a:    float = 1e-3,

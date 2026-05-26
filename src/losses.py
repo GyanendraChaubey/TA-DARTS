@@ -6,6 +6,8 @@ Task-aware loss routing.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -30,15 +32,60 @@ _DERMA_CLASS_WEIGHTS = torch.tensor(
 
 # ChestMNIST (task 1) — 14 binary labels, mostly negative.
 # pos_weight reweights the positive class in BCEWithLogitsLoss.
+# This static fallback is replaced at retrain time by per-label computed weights.
 _CHEST_POS_WEIGHT = torch.ones(14) * 10.0
+
+# Focal loss gamma for DermaMNIST — γ=2 is standard; higher values increase
+# focus on hard examples but can destabilise early training.
+_DERMA_FOCAL_GAMMA: float = 2.0
+
+
+def _multiclass_focal_loss(
+    logits:          Tensor,
+    targets:         Tensor,
+    gamma:           float            = 2.0,
+    weight:          Optional[Tensor] = None,
+    label_smoothing: float            = 0.0,
+) -> Tensor:
+    """
+    Multiclass focal loss (Lin et al., ICCV 2017).
+
+    FL(p_t) = -(1 - p_t)^γ · log(p_t)
+
+    Adaptively down-weights well-classified examples so training concentrates
+    on hard, misclassified samples — more effective than fixed class weights
+    for DermaMNIST's severe long-tail distribution.
+
+    Args:
+        logits          : Raw logits (B, C).
+        targets         : Class indices (B,).
+        gamma           : Focusing parameter (0 = standard CE).
+        weight          : Optional per-class weights (C,).
+        label_smoothing : Label smoothing for the base CE loss.
+    """
+    ce = F.cross_entropy(
+        logits, targets,
+        weight=weight,
+        label_smoothing=label_smoothing,
+        reduction="none",
+    )
+    with torch.no_grad():
+        probs = F.softmax(logits, dim=-1)
+        p_t   = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        # Clamp away from 1.0 to avoid 0^0 NaN when γ > 0.
+        focal_weight = (1.0 - p_t.clamp(max=1.0 - 1e-6)) ** gamma
+    return (focal_weight * ce).mean()
 
 
 def task_loss(
-    logits:          Tensor,
-    labels,          # int scalar | float Tensor [num_classes] | list thereof
-    task_id:         int,
-    device:          torch.device,
-    label_smoothing: float = 0.0,
+    logits:            Tensor,
+    labels,            # int scalar | float Tensor [num_classes] | list thereof
+    task_id:           int,
+    device:            torch.device,
+    label_smoothing:   float            = 0.0,
+    use_class_weights: bool             = True,
+    use_focal:         bool             = False,
+    chest_pos_weight:  Optional[Tensor] = None,
 ) -> Tensor:
     """
     Route to the correct loss function per task.
@@ -47,18 +94,31 @@ def task_loss(
         BCEWithLogitsLoss — sigmoid applied internally for numerical stability.
         Labels must be float multi-hot vectors. label_smoothing not applied.
         pos_weight applied to reweight sparse positive labels.
+        ``chest_pos_weight`` overrides the static fallback when provided
+        (pass per-label weights computed from the actual training split).
 
     Single-label tasks (PathMNIST, DermaMNIST):
         CrossEntropyLoss — standard multi-class classification.
         label_smoothing applied when > 0.
-        DermaMNIST uses class weights to handle imbalance.
+        DermaMNIST uses class weights to handle imbalance unless
+        ``use_class_weights=False`` (set to False when a WeightedRandomSampler
+        already balances the data, to avoid double-correcting imbalance).
+        When ``use_focal=True`` and task_id==2, uses Focal Loss instead of CE
+        to adaptively focus on hard examples.
 
     Args:
-        logits          : Model output, shape (B, num_classes).
-        labels          : Ground-truth — a scalar int, a tensor, or a list.
-        task_id         : Determines loss function and label dtype.
-        device          : Target device for label tensors.
-        label_smoothing : Smoothing factor for CE tasks (0 = disabled).
+        logits             : Model output, shape (B, num_classes).
+        labels             : Ground-truth — a scalar int, a tensor, or a list.
+        task_id            : Determines loss function and label dtype.
+        device             : Target device for label tensors.
+        label_smoothing    : Smoothing factor for CE tasks (0 = disabled).
+        use_class_weights  : If False, disable per-class weights even for
+                             DermaMNIST (use when the DataLoader already
+                             up-samples minority classes via WeightedRandomSampler).
+        use_focal          : If True and task_id==2, use Focal Loss instead of
+                             plain CE for DermaMNIST hard-example mining.
+        chest_pos_weight   : Per-label pos_weight tensor for ChestMNIST (14,).
+                             Overrides the static _CHEST_POS_WEIGHT when given.
     """
     if task_id in TaskAwareSupernet.MULTILABEL_TASKS:
         if isinstance(labels, Tensor):
@@ -67,10 +127,12 @@ def task_loss(
             lbl_t = torch.stack(labels).to(device)
         else:
             lbl_t = labels.to(device)
+        pw = (chest_pos_weight if chest_pos_weight is not None
+              else _CHEST_POS_WEIGHT)
         return F.binary_cross_entropy_with_logits(
             logits,
             lbl_t.float(),
-            pos_weight=_CHEST_POS_WEIGHT.to(device),
+            pos_weight=pw.to(device),
         )
     else:
         if isinstance(labels, Tensor):
@@ -79,9 +141,21 @@ def task_loss(
             lbl_t = torch.tensor(labels, dtype=torch.long, device=device)
 
         # DermaMNIST (task 2): apply class weights to handle imbalance.
+        # Disabled when a WeightedRandomSampler already balances the data
+        # (use_class_weights=False) to avoid double-correcting imbalance.
         weight = None
-        if task_id == 2:
+        if task_id == 2 and use_class_weights:
             weight = _DERMA_CLASS_WEIGHTS.to(device)
+
+        # DermaMNIST focal loss: adaptively down-weights easy examples so
+        # training focuses on hard, misclassified samples.
+        if use_focal and task_id == 2:
+            return _multiclass_focal_loss(
+                logits, lbl_t,
+                gamma=_DERMA_FOCAL_GAMMA,
+                weight=weight,
+                label_smoothing=label_smoothing,
+            )
 
         return F.cross_entropy(
             logits, lbl_t,

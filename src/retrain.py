@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 from torch.utils.data import DataLoader as _DL, WeightedRandomSampler
 
-from .data import MedMNISTDataset, build_weighted_sampler
+from .data import MedMNISTDataset, build_weighted_sampler, compute_chest_pos_weights
 from .losses import task_loss
 from .metrics import evaluate_task
 from .supernet import TaskAwareSupernet
@@ -131,7 +131,7 @@ def _reinit_weights(model: nn.Module) -> None:
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
+            nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
@@ -198,6 +198,9 @@ def retrain_discrete(
     # ── DermaMNIST: build class-balanced DataLoader ────────────────────────
     # Wraps the underlying dataset in a WeightedRandomSampler so each class
     # appears with equal expected frequency, addressing the 67% majority bias.
+    # When the sampler is active, class weights in task_loss are disabled to
+    # avoid double-correcting imbalance (sampler already balances classes).
+    _sampler_active = False
     if task_id == 2 and use_weighted_sampler:
         try:
             sampler = build_weighted_sampler(
@@ -212,12 +215,39 @@ def retrain_discrete(
                 collate_fn=train_loader.collate_fn,
                 pin_memory=train_loader.pin_memory,
             )
+            _sampler_active = True
             logger.info("  [DermaMNIST] Using WeightedRandomSampler for class-balanced batches.")
+            logger.info("  [DermaMNIST] Class weights in loss disabled (sampler already balances).")
         except Exception as exc:
             logger.warning(f"  [DermaMNIST] WeightedRandomSampler failed ({exc}); falling back to original loader.")
             active_train_loader = train_loader
     else:
         active_train_loader = train_loader
+
+    # When the sampler is active, class weights would double-correct the
+    # imbalance that the sampler already handles → disable them.
+    _use_class_weights = not _sampler_active
+
+    # ── ChestMNIST: per-label positive weights ────────────────────────────
+    # The static _CHEST_POS_WEIGHT = 10 × ones(14) is a rough approximation.
+    # Computing exact neg/pos ratios from the training split is far more
+    # accurate given ChestMNIST label prevalence ranges from ~0.2% to ~19%.
+    if task_id == 1:
+        _chest_pw = compute_chest_pos_weights(train_loader.dataset)
+        logger.info(
+            f"  [ChestMNIST] Per-label pos_weights computed from training data"
+            f"  (min={_chest_pw.min():.1f}  max={_chest_pw.max():.1f}"
+            f"  mean={_chest_pw.mean():.1f})"
+        )
+    else:
+        _chest_pw = None
+
+    # ── DermaMNIST: focal loss for hard-example mining ────────────────────
+    # When the sampler balances classes, class weights are disabled.  Focal
+    # loss fills the gap by adaptively down-weighting easy examples so
+    # gradients concentrate on hard, misclassified samples — more effective
+    # than static class weights for a severe long-tail distribution.
+    _use_focal = (task_id == 2)
 
     n_params = sum(p.numel() for p in discrete_model.parameters())
     logger.info(f"  Parameters: {n_params:,}")
@@ -271,6 +301,14 @@ def retrain_discrete(
     retrain_patience     = 40 if task_id == 2 else 20
     retrain_no_improve   = 0
 
+    # ── SWA (Stochastic Weight Averaging) ────────────────────────────────────
+    # Averages weights in the last 25% of training (or last 50 epochs) to
+    # find a flatter, better-generalising minimum without extra training time.
+    # Replaces the single best-checkpoint restore at the end of training.
+    _swa_start   = max(num_epochs * 3 // 4, num_epochs - 50)
+    _swa_model   = torch.optim.swa_utils.AveragedModel(discrete_model)
+    _swa_updated = False
+
     for epoch in range(1, num_epochs + 1):
         discrete_model.train()
         epoch_loss = 0.0
@@ -316,20 +354,28 @@ def retrain_discrete(
 
             if use_aug and is_multilabel:
                 # Mix float multi-hot label vectors directly for BCE.
-                from .losses import _CHEST_POS_WEIGHT
                 lbl_a = torch.stack(labels_k).to(device)
                 lbl_b = torch.stack(labels_k_shuf).to(device)
+                pw    = _chest_pw if _chest_pw is not None else None
+                from .losses import _CHEST_POS_WEIGHT
+                pw = pw if pw is not None else _CHEST_POS_WEIGHT
                 loss  = F.binary_cross_entropy_with_logits(
                     logits, lam * lbl_a + (1.0 - lam) * lbl_b,
-                    pos_weight=_CHEST_POS_WEIGHT.to(device),
+                    pos_weight=pw.to(device),
                 )
             elif use_aug:
                 # Weighted sum of CE losses for the two mixed classes.
                 loss = (
                     lam * task_loss(logits, labels_k, task_id, device,
-                                    label_smoothing)
+                                    label_smoothing,
+                                    use_class_weights=_use_class_weights,
+                                    use_focal=_use_focal,
+                                    chest_pos_weight=_chest_pw)
                     + (1.0 - lam) * task_loss(logits, labels_k_shuf, task_id,
-                                              device, label_smoothing)
+                                              device, label_smoothing,
+                                              use_class_weights=_use_class_weights,
+                                              use_focal=_use_focal,
+                                              chest_pos_weight=_chest_pw)
                 )
             else:
                 # DermaMNIST: use minimal label smoothing so decision
@@ -337,7 +383,10 @@ def retrain_discrete(
                 # 7-class imbalanced dataset.
                 effective_ls = 0.02 if task_id == 2 else label_smoothing
                 loss = task_loss(logits, labels_k, task_id, device,
-                                 effective_ls)
+                                 effective_ls,
+                                 use_class_weights=_use_class_weights,
+                                 use_focal=_use_focal,
+                                 chest_pos_weight=_chest_pw)
 
             loss.backward()
             nn.utils.clip_grad_norm_(discrete_model.parameters(), grad_clip)
@@ -347,9 +396,15 @@ def retrain_discrete(
 
         scheduler.step()
 
+        # Accumulate SWA snapshot once we enter the averaging window.
+        if epoch >= _swa_start:
+            _swa_model.update_parameters(discrete_model)
+            _swa_updated = True
+
         # Evaluate every epoch for fine-grained best-checkpoint selection.
         val_metrics = evaluate_task(
             discrete_model, val_loader, task_id, device, is_supernet=False,
+            balanced_training=_sampler_active,
         )
         if epoch % 10 == 0 or epoch == num_epochs:
             avg_loss = epoch_loss / max(n_batches, 1)
@@ -373,7 +428,30 @@ def retrain_discrete(
                 )
                 break
 
-    if best_state is not None:
+    if _swa_updated:
+        # Copy averaged parameters into discrete_model.
+        _swa_sd = {
+            (k[len("module."):] if k.startswith("module.") else k): v
+            for k, v in _swa_model.state_dict().items()
+        }
+        discrete_model.load_state_dict(_swa_sd)
+        # Refresh BN running stats using task-filtered images (cumulative MA).
+        for _m in discrete_model.modules():
+            if isinstance(_m, nn.BatchNorm2d):
+                _m.reset_running_stats()
+                _m.momentum = None   # triggers 1/N cumulative moving average
+        discrete_model.train()
+        with torch.no_grad():
+            for _imgs, _lbls, _tids in active_train_loader:
+                _mask = (_tids == task_id)
+                if not _mask.any():
+                    continue
+                discrete_model(_imgs[_mask].to(device))
+        logger.info(
+            f"  [{task_name}] SWA applied"
+            f" (averaged from epoch {_swa_start}/{num_epochs})."
+        )
+    elif best_state is not None:
         discrete_model.load_state_dict(best_state)
 
     # ChestMNIST: calibrate per-label thresholds on val set before test eval
@@ -390,11 +468,13 @@ def retrain_discrete(
         test_metrics = evaluate_task_tta(
             discrete_model, test_loader, task_id, device, is_supernet=False,
             chest_thresholds=chest_thresholds,
+            balanced_training=_sampler_active,
         )
     else:
         test_metrics = evaluate_task(
             discrete_model, test_loader, task_id, device, is_supernet=False,
             chest_thresholds=chest_thresholds,
+            balanced_training=_sampler_active,
         )
     logger.info(
         f"  [{task_name}] FINAL TEST"

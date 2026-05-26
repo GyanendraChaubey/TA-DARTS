@@ -72,12 +72,13 @@ def _safe_auc(
 
 @torch.no_grad()
 def evaluate_task(
-    model:       nn.Module,
-    loader:      DataLoader,
-    task_id:     int,
-    device:      torch.device,
-    is_supernet: bool = True,
-    chest_thresholds: "Optional[np.ndarray]" = None,
+    model:                  nn.Module,
+    loader:                 DataLoader,
+    task_id:                int,
+    device:                 torch.device,
+    is_supernet:            bool = True,
+    chest_thresholds:       "Optional[np.ndarray]" = None,
+    balanced_training:      bool = False,
 ) -> Dict[str, float]:
     """
     Evaluate ``model`` on samples belonging to ``task_id`` in ``loader``.
@@ -92,6 +93,11 @@ def evaluate_task(
         is_supernet        : If True call model(imgs, task_id); else call model(imgs).
         chest_thresholds   : Optional (14,) array of per-label thresholds for
                              ChestMNIST accuracy.  If None, uses 0.5 globally.
+        balanced_training  : Set True when the model was trained on class-balanced
+                             data (e.g., via WeightedRandomSampler).  Changes the
+                             DermaMNIST ACC prior correction from dividing by prior
+                             (correct for imbalanced training) to multiplying by
+                             prior (correct for balanced training).
 
     Returns:
         {"acc": float, "auc": float, "loss": float, "n": int}
@@ -158,11 +164,15 @@ def evaluate_task(
         if task_id == 2 and not is_supernet:
             # Prior-probability correction for DermaMNIST ACC.
             # Only applied to a fully-trained discrete model (is_supernet=False).
-            # During search the supernet outputs near-uniform softmax; dividing
-            # by the skewed class prior (class 5 = 67%) amplifies random noise
-            # in rare classes by ×80 and crashes ACC to ~0.01.  The correction
-            # is only meaningful once the model has learned discriminative
-            # features (retrain phase).
+            # During search the supernet outputs near-uniform softmax; the
+            # correction amplifies random noise in rare classes and crashes ACC.
+            #
+            # Direction depends on how the model was trained:
+            #   Imbalanced training → model is biased toward majority class
+            #     → divide by prior to de-bias (amplify rare classes).
+            #   Balanced training (WeightedRandomSampler) → model outputs are
+            #     already calibrated under a uniform prior → multiply by true
+            #     prior to match the test-set distribution for optimal argmax.
             _n_cls  = MedMNISTDataset.NUM_CLASSES[2]  # 7
             _counts = np.bincount(
                 y_true_flat.astype(int), minlength=_n_cls
@@ -170,7 +180,12 @@ def evaluate_task(
             _prior  = _counts / (_counts.sum() + 1e-8)
             # Floor at 1/n_classes so no class is amplified more than n_classes×.
             _prior  = np.maximum(_prior, 1.0 / _n_cls)
-            y_score_corrected = y_score / _prior
+            if balanced_training:
+                # Balanced training: re-introduce the test prior.
+                y_score_corrected = y_score * _prior
+            else:
+                # Imbalanced training: de-bias toward majority class.
+                y_score_corrected = y_score / _prior
             y_pred = np.argmax(y_score_corrected, axis=-1)
         else:
             y_pred = np.argmax(y_score, axis=-1)
@@ -215,13 +230,14 @@ def evaluate(
 
 @torch.no_grad()
 def evaluate_task_tta(
-    model:            nn.Module,
-    loader:           DataLoader,
-    task_id:          int,
-    device:           torch.device,
-    is_supernet:      bool                    = False,
-    n_tta:            int                     = 8,
-    chest_thresholds: "Optional[np.ndarray]"  = None,
+    model:             nn.Module,
+    loader:            DataLoader,
+    task_id:           int,
+    device:            torch.device,
+    is_supernet:       bool                    = False,
+    n_tta:             int                     = 8,
+    chest_thresholds:  "Optional[np.ndarray]"  = None,
+    balanced_training: bool                    = False,
 ) -> Dict[str, float]:
     """
     Evaluate ``model`` with test-time augmentation (TTA).
@@ -232,13 +248,15 @@ def evaluate_task_tta(
     :func:`evaluate_task`, including the DermaMNIST prior correction.
 
     Args:
-        model            : Discrete model (is_supernet=False) or supernet.
-        loader           : Mixed-task DataLoader.
-        task_id          : Which task to filter and evaluate.
-        device           : Compute device.
-        is_supernet      : If True call model(imgs, task_id); else model(imgs).
-        n_tta            : Number of augmented views to average (default 8).
-        chest_thresholds : Optional per-label thresholds for ChestMNIST ACC.
+        model             : Discrete model (is_supernet=False) or supernet.
+        loader            : Mixed-task DataLoader.
+        task_id           : Which task to filter and evaluate.
+        device            : Compute device.
+        is_supernet       : If True call model(imgs, task_id); else model(imgs).
+        n_tta             : Number of augmented views to average (default 8).
+        chest_thresholds  : Optional per-label thresholds for ChestMNIST ACC.
+        balanced_training : Passed through to :func:`evaluate_task` to control
+                            the direction of the DermaMNIST prior correction.
 
     Returns:
         {"acc": float, "auc": float, "loss": float, "n": int}
@@ -336,7 +354,10 @@ def evaluate_task_tta(
             ).astype(np.float64)
             _prior  = _counts / (_counts.sum() + 1e-8)
             _prior  = np.maximum(_prior, 1.0 / _n_cls)
-            y_score_corrected = y_score / _prior
+            if balanced_training:
+                y_score_corrected = y_score * _prior
+            else:
+                y_score_corrected = y_score / _prior
             y_pred = np.argmax(y_score_corrected, axis=-1)
         else:
             y_pred = np.argmax(y_score, axis=-1)
