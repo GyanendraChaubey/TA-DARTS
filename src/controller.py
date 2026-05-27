@@ -47,7 +47,7 @@ class SearchController:
         self,
         model:             TaskAwareSupernet,
         epochs:            int,
-        lr_weights:        float = 0.025,
+        lr_weights:        float = 1e-3,
         lr_alphas:         float = 3e-4,
         momentum:          float = 0.9,
         weight_decay_w:    float = 3e-4,
@@ -82,12 +82,10 @@ class SearchController:
         # Label smoothing for CE tasks during search
         self.label_smoothing   = label_smoothing
 
-        self.opt_weights = torch.optim.SGD(
+        self.opt_weights = torch.optim.AdamW(
             model.weight_parameters(),
             lr=lr_weights,
-            momentum=momentum,
             weight_decay=weight_decay_w,
-            nesterov=True,
         )
         self.opt_arch = torch.optim.Adam(
             model.arch_parameters(),
@@ -111,9 +109,14 @@ class SearchController:
         task_ids: torch.Tensor,
         device:   torch.device,
     ) -> torch.Tensor:
-        """Weighted-average loss across tasks present in this mini-batch."""
-        total_loss = torch.tensor(0.0, device=device)
-        n_samples  = 0
+        """Task-normalised loss: equal weight per task regardless of sample count.
+
+        Previous behaviour was sample-weighted averaging, which let PathMNIST
+        (90k samples) dominate over DermaMNIST (7k).  Now each task's mean
+        loss contributes equally so architecture search is not biased toward
+        the largest dataset.
+        """
+        task_losses = []
 
         for k in range(self.num_tasks):
             mask = (task_ids == k)
@@ -126,12 +129,12 @@ class SearchController:
             logits_k = self.model(imgs_k, k, tau=self._current_tau)
             loss_k   = task_loss(logits_k, labels_k, k, device,
                                  self.label_smoothing)
-            total_loss = total_loss + loss_k * mask.sum()
-            n_samples += mask.sum().item()
+            task_losses.append(loss_k)
 
-        if n_samples > 0:
-            total_loss = total_loss / n_samples
-        return total_loss
+        if task_losses:
+            # Equal-weight mean across tasks (not across samples).
+            return sum(task_losses) / len(task_losses)
+        return torch.tensor(0.0, device=device)
 
     def _run_microbatched_backward(
         self,

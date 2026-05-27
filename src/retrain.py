@@ -309,7 +309,18 @@ def retrain_discrete(
     _swa_model   = torch.optim.swa_utils.AveragedModel(discrete_model)
     _swa_updated = False
 
+    # ── EMA (Exponential Moving Average) ─────────────────────────────────────
+    # Updates every batch step. Often generalises better than the main model.
+    ema_avg_fn = lambda avg_param, param, num_avg: 0.9999 * avg_param + 0.0001 * param
+    _ema_model = torch.optim.swa_utils.AveragedModel(discrete_model, avg_fn=ema_avg_fn)
+
     for epoch in range(1, num_epochs + 1):
+        # Scale drop_prob linearly from 0.0 to 0.2
+        drop_path_prob = 0.2 * (epoch - 1) / (num_epochs - 1) if num_epochs > 1 else 0.0
+        for m in discrete_model.modules():
+            if hasattr(m, 'drop_prob'):
+                m.drop_prob = drop_path_prob
+
         discrete_model.train()
         epoch_loss = 0.0
         n_batches  = 0
@@ -391,6 +402,7 @@ def retrain_discrete(
             loss.backward()
             nn.utils.clip_grad_norm_(discrete_model.parameters(), grad_clip)
             optimizer.step()
+            _ema_model.update_parameters(discrete_model)
             epoch_loss += loss.item()
             n_batches  += 1
 
@@ -401,9 +413,9 @@ def retrain_discrete(
             _swa_model.update_parameters(discrete_model)
             _swa_updated = True
 
-        # Evaluate every epoch for fine-grained best-checkpoint selection.
+        # Evaluate EMA model every epoch for fine-grained best-checkpoint selection.
         val_metrics = evaluate_task(
-            discrete_model, val_loader, task_id, device, is_supernet=False,
+            _ema_model, val_loader, task_id, device, is_supernet=False,
             balanced_training=_sampler_active,
         )
         if epoch % 10 == 0 or epoch == num_epochs:
@@ -416,7 +428,7 @@ def retrain_discrete(
             )
         if val_metrics["auc"] > best_val_auc:
             best_val_auc       = val_metrics["auc"]
-            best_state         = copy.deepcopy(discrete_model.state_dict())
+            best_state         = copy.deepcopy(_ema_model.module.state_dict())
             retrain_no_improve = 0
         else:
             retrain_no_improve += 1
@@ -433,6 +445,7 @@ def retrain_discrete(
         _swa_sd = {
             (k[len("module."):] if k.startswith("module.") else k): v
             for k, v in _swa_model.state_dict().items()
+            if k != "n_averaged"
         }
         discrete_model.load_state_dict(_swa_sd)
         # Refresh BN running stats using task-filtered images (cumulative MA).

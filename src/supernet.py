@@ -80,15 +80,29 @@ class TaskAwareSupernet(nn.Module):
 
         self.stems = nn.ModuleList([_make_stem() for _ in range(num_tasks)])
 
-        self.cells = nn.ModuleList(
-            [MixedOp(channels) for _ in range(num_layers)]
-        )
+        self.downsample_layers = [num_layers // 3, 2 * num_layers // 3]
+        self.cells = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        
+        c = channels
+        for i in range(num_layers):
+            if i in self.downsample_layers:
+                self.downsamples.append(nn.Sequential(
+                    nn.Conv2d(c, c * 2, 3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(c * 2),
+                    nn.ReLU6(inplace=True)
+                ))
+                c *= 2
+            else:
+                self.downsamples.append(nn.Identity())
+            self.cells.append(MixedOp(c))
 
         # ── Task-specific classification heads ────────────────────────────
         # PathMNIST / ChestMNIST: GAP → Dropout(0.3) → FC(4C) → ReLU → Dropout(0.2) → FC(nc)
         # DermaMNIST (task 2): deeper head with BN + extra hidden layer to
         #   improve calibration on the 7-class imbalanced 10k dataset.
-        hidden_dim = max(channels * 4, 256)
+        final_channels = c
+        hidden_dim = max(final_channels * 4, 256)
         heads: list = []
         for t, nc in enumerate(num_classes_per_task):
             if t == 2:
@@ -97,12 +111,12 @@ class TaskAwareSupernet(nn.Module):
                 # micro-batches (common when task_id==2 has 1 DermaMNIST image
                 # in a given batch).  LN normalises per-feature and works with
                 # any batch size.
-                hidden2 = max(channels * 2, 128)
+                hidden2 = max(final_channels * 2, 128)
                 heads.append(nn.Sequential(
                     nn.AdaptiveAvgPool2d(1),
                     nn.Flatten(),
                     nn.Dropout(p=0.3),
-                    nn.Linear(channels, hidden_dim),
+                    nn.Linear(final_channels, hidden_dim),
                     nn.LayerNorm(hidden_dim),
                     nn.ReLU(inplace=True),
                     nn.Dropout(p=0.2),
@@ -116,7 +130,7 @@ class TaskAwareSupernet(nn.Module):
                     nn.AdaptiveAvgPool2d(1),
                     nn.Flatten(),
                     nn.Dropout(p=0.3),
-                    nn.Linear(channels, hidden_dim),
+                    nn.Linear(final_channels, hidden_dim),
                     nn.ReLU(inplace=True),
                     nn.Dropout(p=0.2),
                     nn.Linear(hidden_dim, nc),
@@ -168,6 +182,7 @@ class TaskAwareSupernet(nn.Module):
 
         x = self.stems[task_id](x)
         for i, cell in enumerate(self.cells):
+            x = self.downsamples[i](x)
             x = cell(x, weights_per_layer[i])
         return self.heads[task_id](x)
 
@@ -191,15 +206,13 @@ class TaskAwareSupernet(nn.Module):
         ready for stand-alone retraining.
         """
         best_indices = self.alphas[task_id].argmax(dim=-1).tolist()
-        chosen: List[nn.Module] = [
-            copy.deepcopy(self.cells[l].ops[idx])
-            for l, idx in enumerate(best_indices)
-        ]
-        discrete = nn.Sequential(
-            copy.deepcopy(self.stems[task_id]),
-            *chosen,
-            copy.deepcopy(self.heads[task_id]),
-        )
+        discrete = nn.Sequential()
+        discrete.add_module("stem", copy.deepcopy(self.stems[task_id]))
+        for l, idx in enumerate(best_indices):
+            if l in self.downsample_layers:
+                discrete.add_module(f"downsample_{l}", copy.deepcopy(self.downsamples[l]))
+            discrete.add_module(f"cell_{l}", copy.deepcopy(self.cells[l].ops[idx]))
+        discrete.add_module("head", copy.deepcopy(self.heads[task_id]))
         name = _TASK_NAMES.get(task_id, str(task_id))
         print(f"\n[discretize] Task {task_id} ({name}):")
         for l, idx in enumerate(best_indices):

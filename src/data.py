@@ -151,7 +151,6 @@ class MedMNISTDataset(Dataset):
                 img = t
                 if self.IS_GRAYSCALE[task_id]:
                     img = img.mean(dim=0, keepdim=True).repeat(3, 1, 1)
-                img = self.transforms[task_id](img)
 
                 if self.IS_MULTILABEL[task_id]:
                     lbl = torch.from_numpy(lbl_np.flatten().astype("float32"))
@@ -181,7 +180,6 @@ class MedMNISTDataset(Dataset):
             else:
                 img  = torch.rand(3, self.img_size, self.img_size, generator=rng)
 
-            img = self.transforms[task_id](img)
 
             if self.IS_MULTILABEL[task_id]:
                 nc       = self.NUM_CLASSES[task_id]
@@ -205,7 +203,10 @@ class MedMNISTDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx: int):
-        return self.images[idx], self.labels[idx], self.task_ids[idx]
+        img = self.images[idx]
+        task_id = self.task_ids[idx]
+        img = self.transforms[task_id](img)
+        return img, self.labels[idx], task_id
 
     @staticmethod
     def collate_fn(batch):

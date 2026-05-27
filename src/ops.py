@@ -15,6 +15,25 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+def drop_path(x: torch.Tensor, drop_prob: float = 0., training: bool = False) -> torch.Tensor:
+    """Drop paths (Stochastic Depth) per sample."""
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    return x.div(keep_prob) * random_tensor
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample."""
+    def __init__(self, drop_prob: float = 0.0):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
 from .utils import _make_divisible
 
 
@@ -69,6 +88,8 @@ class MBConv(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out = self.conv(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
         return out + x if self.use_res else out
 
 
@@ -98,7 +119,10 @@ class DilatedConv3x3(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x) + x
+        out = self.op(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 class DilatedConv5x5(nn.Module):
@@ -117,7 +141,10 @@ class DilatedConv5x5(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x) + x
+        out = self.op(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 class SEBlock(nn.Module):
@@ -154,7 +181,10 @@ class MBConvSE(nn.Module):
         self.se = SEBlock(channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.se(self.conv(x)) + x
+        out = self.se(self.conv(x))
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 class SepConv3x3(nn.Module):
@@ -173,7 +203,10 @@ class SepConv3x3(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x) + x
+        out = self.op(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 class SepConv5x5(nn.Module):
@@ -192,7 +225,10 @@ class SepConv5x5(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x) + x
+        out = self.op(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 class SkipConnect(nn.Module):
@@ -208,7 +244,10 @@ class AvgPool3x3(nn.Module):
         self.op = nn.AvgPool2d(3, stride=1, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x)
+        out = self.op(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 class MaxPool3x3(nn.Module):
@@ -219,7 +258,10 @@ class MaxPool3x3(nn.Module):
         self.op = nn.MaxPool2d(3, stride=1, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.op(x)
+        out = self.op(x)
+        if hasattr(self, 'drop_prob'):
+            out = drop_path(out, self.drop_prob, self.training)
+        return out + x
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -38,9 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Batch size")
     g.add_argument("--layers",          type=int,   default=8,
                    help="Number of searchable layers")
-    g.add_argument("--channels",        type=int,   default=64,
+    g.add_argument("--channels",        type=int,   default=128,
                    help="Feature map channel width")
-    g.add_argument("--lr_w",            type=float, default=0.025,
+    g.add_argument("--lr_w",            type=float, default=1e-3,
                    help="Weight optimiser learning rate")
     g.add_argument("--lr_a",            type=float, default=3e-4,
                    help="Alpha optimiser learning rate")
@@ -53,9 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Contrib. [B]
     g.add_argument("--tau_init",        type=float, default=1.5,
                    help="[B] Initial sparsemax temperature")
-    g.add_argument("--anneal_factor",   type=float, default=0.90,
+    g.add_argument("--anneal_factor",   type=float, default=0.95,
                    help="[B] Temperature annealing factor per interval")
-    g.add_argument("--anneal_interval", type=int,   default=3,
+    g.add_argument("--anneal_interval", type=int,   default=5,
                    help="[B] Epochs between temperature decay steps")
     g.add_argument("--tau_min",         type=float, default=0.30,
                    help="[B] Minimum sparsemax temperature floor (prevents collapse)")
@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     g3.add_argument("--seed",           type=int,   default=42)
     g3.add_argument("--workers",        type=int,   default=0,
                     help="DataLoader num_workers")
-    g3.add_argument("--img-size",       type=int,   default=64,
+    g3.add_argument("--img-size",       type=int,   default=28,
                     help="Input resolution: 28 | 64 | 128 (64 recommended)")
     g3.add_argument("--search-micro-batch", type=int, default=0,
                     help="Micro-batch size used only during search steps (0 = full batch)")
