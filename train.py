@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from src.controller import SearchController
-from src.data import MedMNISTDataset, build_dataloaders
+from src.data import build_dataloaders
 from src.metrics import alpha_entropy, evaluate
 from src.ops import OP_NAMES
 from src.reporting import print_benchmark_table, save_benchmark_results
@@ -77,6 +77,7 @@ def run_search(
     label_smoothing:   float        = 0.1,
     search_micro_batch:int          = 0,
     use_tta:           bool         = False,
+    task_ids:          Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
     Execute the full MT-DARTS v2 pipeline and return benchmark results.
@@ -89,20 +90,25 @@ def run_search(
     device = torch.device(device_str)
     os.makedirs(save_dir, exist_ok=True)
 
-    # ── CSV writer for search training curves ────────────────────────────────
+    # ── Resolve task list ─────────────────────────────────────────────────────
+    from src.data import TASK_REGISTRY, DEFAULT_TASK_IDS
+    _task_ids: List[int] = sorted(task_ids) if task_ids is not None else DEFAULT_TASK_IDS
+    num_tasks = len(_task_ids)
+    task_names = {pos: TASK_REGISTRY[tid][0] for pos, tid in enumerate(_task_ids)}
+    logger.info(f"  Tasks: {[TASK_REGISTRY[t][0] for t in _task_ids]}")
+
+    # ── CSV writer for search training curves (dynamic columns) ──────────────
     csv_path = os.path.join(save_dir, "search_curves.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "epoch",
-            "PathMNIST_auc",  "PathMNIST_acc",
-            "ChestMNIST_auc", "ChestMNIST_acc",
-            "DermaMNIST_auc", "DermaMNIST_acc",
-            "alpha_entropy",  "tau",
-        ])
+        header = ["epoch"]
+        for pos in range(num_tasks):
+            header += [f"{task_names[pos]}_auc", f"{task_names[pos]}_acc"]
+        header += ["alpha_entropy", "tau"]
+        writer.writerow(header)
 
-    # ── Best-accuracy checkpoint tracking (per task, updated every epoch) ────
-    best_acc_per_task: Dict[int, float] = {0: -1.0, 1: -1.0, 2: -1.0}
+    # ── Best-accuracy checkpoint tracking (per supernet position) ─────────────
+    best_acc_per_task: Dict[int, float] = {k: -1.0 for k in range(num_tasks)}
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader_bilevel, eval_loader = build_dataloaders(
@@ -111,15 +117,16 @@ def run_search(
         use_real_data=use_real_data,
         seed=seed,
         img_size=img_size,
+        task_ids=_task_ids,
     )
 
     # ── Model & controller ────────────────────────────────────────────────────
     model = TaskAwareSupernet(
-        num_tasks=3,
+        num_tasks=num_tasks,
         num_layers=num_layers,
         channels=channels,
-        num_classes_per_task=[9, 14, 7],
         img_size=img_size,
+        task_ids=_task_ids,
     ).to(device)
 
     controller = SearchController(
@@ -172,13 +179,23 @@ def run_search(
     best_tau            = tau_init
     best_alpha_epoch    = start_epoch
     auc_no_improve      = 0          # patience counter
-    # Derma-aware weighted snapshot: weights = [0.35 Path, 0.25 Chest, 0.40 Derma]
-    # Derma gets extra weight because it is the hardest task and is drowned out
-    # in a simple mean.  We track both and discretise from whichever is higher.
-    best_weighted_auc   = -1.0
+    # Weighted snapshot: small/hard tasks get higher weight so they are not
+    # drowned out by large datasets.  Weight is inversely proportional to
+    # log(train_set_size) as a proxy for task difficulty.
+    # Falls back to uniform 1/T if TASK_REGISTRY sizes are unknown.
+    _APPROX_SIZES = {0: 89996, 1: 78468, 2: 7007, 3: 97477, 4: 4708,
+                     5: 1600, 6: 546, 7: 11959, 8: 165466, 9: 34581,
+                     10: 13000, 11: 13940}
+    import math
+    _raw_w = {pos: 1.0 / math.log1p(_APPROX_SIZES.get(tid, 10000))
+              for pos, tid in enumerate(_task_ids)}
+    _sum_w = sum(_raw_w.values())
+    _task_weights = {pos: w / _sum_w for pos, w in _raw_w.items()}
+
+    best_weighted_auc    = -1.0
     best_weighted_alphas = model.alphas.detach().clone()
-    best_weighted_tau   = tau_init
-    best_weighted_epoch = start_epoch
+    best_weighted_tau    = tau_init
+    best_weighted_epoch  = start_epoch
 
     for epoch in range(start_epoch, num_epochs + 1):
         model.train()
@@ -240,7 +257,7 @@ def run_search(
                 _task_acc = _metrics.get("acc", 0.0)
                 if _task_acc > best_acc_per_task[_k]:
                     best_acc_per_task[_k] = _task_acc
-                    _tname = MedMNISTDataset.TASK_NAMES.get(_k, f"task{_k}")
+                    _tname = task_names.get(_k, f"task{_k}")
                     controller.save_checkpoint(
                         epoch, ckpt_dir=ckpt_dir,
                         tag=f"best_acc_{_tname.lower()}"
@@ -256,10 +273,9 @@ def run_search(
                 eval_results[k].get("auc", 0.0) for k in eval_results
             ) / max(len(eval_results), 1)
 
-            # Derma-aware weighted AUC (Path=0.35, Chest=0.25, Derma=0.40)
-            _w = {0: 0.35, 1: 0.25, 2: 0.40}
+            # Task-size-aware weighted AUC (smaller datasets get higher weight).
             weighted_auc = sum(
-                _w.get(k, 1/3) * eval_results[k].get("auc", 0.0)
+                _task_weights.get(k, 1.0 / num_tasks) * eval_results[k].get("auc", 0.0)
                 for k in eval_results
             )
             if weighted_auc > best_weighted_auc:
@@ -270,7 +286,6 @@ def run_search(
                 logger.info(
                     f"  [best-α-weighted] Saved at epoch {epoch}"
                     f"  weighted_auc={best_weighted_auc:.4f}"
-                    f"  (Derma={eval_results.get(2,{}).get('auc',0):.4f})"
                 )
 
             if mean_auc > best_mean_auc:
@@ -310,21 +325,16 @@ def run_search(
             f"  Mean alpha entropy: {ent:.4f} (threshold={entropy_threshold})"
         )
 
-        # ── Write training curves to CSV (AUC + ACC per task) ────────────────
+        # ── Write training curves to CSV (dynamic columns per active task) ──
         if eval_results is not None:
             with open(csv_path, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    epoch,
-                    f"{eval_results.get(0, {}).get('auc', float('nan')):.4f}",
-                    f"{eval_results.get(0, {}).get('acc', float('nan')):.4f}",
-                    f"{eval_results.get(1, {}).get('auc', float('nan')):.4f}",
-                    f"{eval_results.get(1, {}).get('acc', float('nan')):.4f}",
-                    f"{eval_results.get(2, {}).get('auc', float('nan')):.4f}",
-                    f"{eval_results.get(2, {}).get('acc', float('nan')):.4f}",
-                    f"{ent:.6f}",
-                    f"{controller._current_tau:.4f}",
-                ])
+                row = [epoch]
+                for pos in range(num_tasks):
+                    row.append(f"{eval_results.get(pos, {}).get('auc', float('nan')):.4f}")
+                    row.append(f"{eval_results.get(pos, {}).get('acc', float('nan')):.4f}")
+                row += [f"{ent:.6f}", f"{controller._current_tau:.4f}"]
+                writer.writerow(row)
 
         # ── Per-task architecture snapshot every eval epoch ──────────────────
         if eval_results is not None:
@@ -337,7 +347,7 @@ def run_search(
                     model.alphas.detach(), tau=controller._current_tau
                 )
                 for _t in range(model.num_tasks):
-                    _tname2 = MedMNISTDataset.TASK_NAMES.get(_t, f"Task{_t}")
+                    _tname2 = task_names.get(_t, f"Task{_t}")
                     _best_ops = model.alphas[_t].argmax(dim=-1).tolist()
                     _arch_ops = [OP_NAMES[i] for i in _best_ops]
                     _t_auc = eval_results.get(_t, {}).get("auc", float("nan"))
@@ -395,7 +405,7 @@ def run_search(
         from src.normalizers import annealed_sparsemax as _sp
         _soft = _sp(best_alphas, tau=best_tau)
         for t in range(model.num_tasks):
-            tname = MedMNISTDataset.TASK_NAMES.get(t, f"Task{t}")
+            tname = task_names.get(t, f"Task{t}")
             best  = best_alphas[t].argmax(dim=-1).tolist()
             arch  = [OP_NAMES[i] for i in best]
             f.write(f"{tname}: {arch}\n")
@@ -428,7 +438,7 @@ def run_search(
     # ── Phase B sanity checks ─────────────────────────────────────────────────
     _skip_retrain: set = set()
     for k in range(model.num_tasks):
-        tname = MedMNISTDataset.TASK_NAMES.get(k, f"Task{k}")
+        tname = task_names.get(k, f"Task{k}")
         arch  = architectures[k]
         logger.info(f"  [{tname}] Discrete arch: {arch}")
 
@@ -443,12 +453,14 @@ def run_search(
             _skip_retrain.add(k)
             continue
 
-        # Soft warning: degenerate all-skip architecture.
-        skip_count = arch.count("SkipConnect")
-        if skip_count >= len(arch) // 2:
+        # Soft warning: degenerate all-ResidualBN architecture (replaces old
+        # SkipConnect check — same collapse symptom, different op name).
+        residual_count = arch.count("ResidualBN")
+        if residual_count >= len(arch) // 2:
             logger.warning(
-                f"  [{tname}] {skip_count}/{len(arch)} layers are SkipConnect"
-                f" — architecture may be degenerate."
+                f"  [{tname}] {residual_count}/{len(arch)} layers are ResidualBN"
+                f" — architecture may still be degenerate. Consider increasing"
+                f" entropy regularisation (arch_reg_lambda)."
             )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -464,6 +476,7 @@ def run_search(
         result = retrain_discrete(
             discrete_model=discrete_models[k],
             task_id=k,
+            registry_id=model.task_ids[k],
             train_loader=train_loader,
             val_loader=val_loader_bilevel,
             test_loader=eval_loader,
@@ -488,7 +501,8 @@ def run_search(
     # PHASE D: Benchmark report
     # ══════════════════════════════════════════════════════════════════════════
     logger.info("\n▶ PHASE D: Benchmark Report")
-    table = print_benchmark_table(benchmark_results, architectures)
+    table = print_benchmark_table(benchmark_results, architectures,
+                                  task_names=task_names)
 
     # Compute search efficiency: mean test AUC per GPU-hour of search.
     _mean_auc = float(np.mean([
@@ -505,6 +519,7 @@ def run_search(
         retrain_time_s=retrain_time,
         save_dir=save_dir,
         search_efficiency=search_efficiency,
+        task_names=task_names,
     )
 
     table_path = os.path.join(save_dir, "benchmark_table.txt")

@@ -23,33 +23,37 @@ from torch.utils.data import DataLoader
 import numpy as np
 from torch.utils.data import DataLoader as _DL, WeightedRandomSampler
 
-from .data import MedMNISTDataset, build_weighted_sampler, compute_chest_pos_weights
+from .data import TASK_REGISTRY, build_weighted_sampler, compute_chest_pos_weights
 from .losses import task_loss
 from .metrics import evaluate_task
-from .supernet import TaskAwareSupernet
 
 logger = logging.getLogger("MT-DARTS")
 
 
 @torch.no_grad()
 def _calibrate_chest_thresholds(
-    model:     nn.Module,
+    model:      nn.Module,
     val_loader: DataLoader,
-    device:    torch.device,
-    n_labels:  int = 14,
+    device:     torch.device,
+    task_id:    int,
+    n_labels:   int = 14,
 ) -> np.ndarray:
     """
     Find per-label decision thresholds that maximise multi-label accuracy
-    on the validation set for ChestMNIST (task 1).
+    on the validation set for ChestMNIST.
 
     Sweeps 20 evenly-spaced thresholds in [0.05, 0.95] per label and picks
     the one with the highest per-label accuracy.  Returns an array of shape
     (n_labels,) used at test-time instead of the fixed 0.5.
+
+    Args:
+        task_id : Position of ChestMNIST within the DataLoader's active task
+                  list (matches the per-sample task labels it yields).
     """
     model.eval()
     all_scores, all_labels = [], []
     for images, labels, task_ids in val_loader:
-        mask = (task_ids == 1)
+        mask = (task_ids == task_id)
         if not mask.any():
             continue
         imgs_k   = images[mask].to(device)
@@ -139,6 +143,7 @@ def _reinit_weights(model: nn.Module) -> None:
 def retrain_discrete(
     discrete_model:       nn.Module,
     task_id:              int,
+    registry_id:          int,
     train_loader:         DataLoader,
     val_loader:           DataLoader,
     test_loader:          DataLoader,
@@ -166,7 +171,15 @@ def retrain_discrete(
 
     Args:
         discrete_model        : Output of :meth:`TaskAwareSupernet.discretize`.
-        task_id               : Task index (determines loss and dataset metadata).
+        task_id               : Position of this task within the active task
+                                list — matches the per-sample task labels
+                                produced by the DataLoaders.
+        registry_id           : This task's id in TASK_REGISTRY (src/data.py).
+                                Used to resolve its name/class-count/multilabel
+                                flag and to gate the DermaMNIST/ChestMNIST-
+                                specific tuning below (registry ids 2 and 1),
+                                independent of where the task lands in a
+                                custom --tasks selection.
         train_loader          : Mixed-task training DataLoader.
         val_loader            : Mixed-task validation DataLoader (best-model selection).
         test_loader           : Mixed-task test DataLoader (final evaluation).
@@ -178,15 +191,15 @@ def retrain_discrete(
         save_dir              : If provided, saves the best checkpoint here.
         mixup_alpha           : Beta distribution alpha for Mixup (0 = disabled).
         label_smoothing       : Label smoothing for CE tasks (0 = disabled).
-        use_weighted_sampler  : If True and task_id==2, build a class-balanced
-                                DataLoader for DermaMNIST retraining.
+        use_weighted_sampler  : If True and this is DermaMNIST, build a
+                                class-balanced DataLoader for retraining.
         use_tta               : If True, use 8-view TTA for final test evaluation.
 
     Returns:
         {"test_acc", "test_auc", "test_loss", "best_val_auc", "n_params"}
     """
-    task_name     = MedMNISTDataset.TASK_NAMES[task_id]
-    is_multilabel = task_id in TaskAwareSupernet.MULTILABEL_TASKS
+    task_name     = TASK_REGISTRY[registry_id][0]
+    is_multilabel = TASK_REGISTRY[registry_id][4]
     logger.info(f"\n{'─' * 60}")
     logger.info(f"Retraining discrete model — {task_name} (task {task_id})")
     logger.info(f"  mixup_alpha={mixup_alpha}  label_smoothing={label_smoothing}")
@@ -201,7 +214,7 @@ def retrain_discrete(
     # When the sampler is active, class weights in task_loss are disabled to
     # avoid double-correcting imbalance (sampler already balances classes).
     _sampler_active = False
-    if task_id == 2 and use_weighted_sampler:
+    if registry_id == 2 and use_weighted_sampler:
         try:
             sampler = build_weighted_sampler(
                 task_id=task_id,
@@ -232,8 +245,9 @@ def retrain_discrete(
     # The static _CHEST_POS_WEIGHT = 10 × ones(14) is a rough approximation.
     # Computing exact neg/pos ratios from the training split is far more
     # accurate given ChestMNIST label prevalence ranges from ~0.2% to ~19%.
-    if task_id == 1:
-        _chest_pw = compute_chest_pos_weights(train_loader.dataset)
+    if registry_id == 1:
+        _chest_pw = compute_chest_pos_weights(train_loader.dataset, task_id=task_id,
+                                               n_labels=TASK_REGISTRY[registry_id][2])
         logger.info(
             f"  [ChestMNIST] Per-label pos_weights computed from training data"
             f"  (min={_chest_pw.min():.1f}  max={_chest_pw.max():.1f}"
@@ -247,16 +261,32 @@ def retrain_discrete(
     # loss fills the gap by adaptively down-weighting easy examples so
     # gradients concentrate on hard, misclassified samples — more effective
     # than static class weights for a severe long-tail distribution.
-    _use_focal = (task_id == 2)
+    _use_focal = (registry_id == 2)
 
     n_params = sum(p.numel() for p in discrete_model.parameters())
     logger.info(f"  Parameters: {n_params:,}")
+
+    # ── FLOPs (multiply-accumulate operations) ────────────────────────────────
+    # Uses thop if available; falls back gracefully so training still runs
+    # without it.  Install with: pip install thop
+    flops_m: float = float("nan")
+    try:
+        from thop import profile as thop_profile
+        # Infer spatial size from the first stem conv's expected input.
+        # We use img_size if accessible, otherwise default to 28.
+        _img_size = getattr(discrete_model, "_img_size", 28)
+        _dummy    = torch.zeros(1, 3, _img_size, _img_size).to(device)
+        _flops, _ = thop_profile(discrete_model, inputs=(_dummy,), verbose=False)
+        flops_m   = _flops / 1e6
+        logger.info(f"  FLOPs: {flops_m:.1f} M")
+    except Exception as _exc:
+        logger.debug(f"  FLOPs not computed (thop unavailable or failed: {_exc})")
 
     optimizer = torch.optim.SGD(
         discrete_model.parameters(),
         lr=lr, momentum=0.9,
         # DermaMNIST needs stronger L2 regularisation (small 7k dataset).
-        weight_decay=weight_decay * 10 if task_id == 2 else weight_decay,
+        weight_decay=weight_decay * 10 if registry_id == 2 else weight_decay,
         nesterov=True,
     )
 
@@ -265,7 +295,7 @@ def retrain_discrete(
     #   Warm restarts help escape the narrow, imbalance-induced local minima
     #   that a simple cosine anneal tends to get trapped in on the 7k set.
     # PathMNIST / ChestMNIST: standard warmup → CosineAnnealingLR.
-    if task_id == 2:
+    if registry_id == 2:
         warmup_epochs = 10
         warmup_sched  = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=0.1, end_factor=1.0,
@@ -298,7 +328,7 @@ def retrain_discrete(
     best_state           = None
     # DermaMNIST is small (7k samples) — allow more patience so retraining
     # does not stop prematurely before augmentation-driven gains appear.
-    retrain_patience     = 40 if task_id == 2 else 20
+    retrain_patience     = 40 if registry_id == 2 else 20
     retrain_no_improve   = 0
 
     # ── SWA (Stochastic Weight Averaging) ────────────────────────────────────
@@ -308,11 +338,6 @@ def retrain_discrete(
     _swa_start   = max(num_epochs * 3 // 4, num_epochs - 50)
     _swa_model   = torch.optim.swa_utils.AveragedModel(discrete_model)
     _swa_updated = False
-
-    # ── EMA (Exponential Moving Average) ─────────────────────────────────────
-    # Updates every batch step. Often generalises better than the main model.
-    ema_avg_fn = lambda avg_param, param, num_avg: 0.9999 * avg_param + 0.0001 * param
-    _ema_model = torch.optim.swa_utils.AveragedModel(discrete_model, avg_fn=ema_avg_fn)
 
     for epoch in range(1, num_epochs + 1):
         # Scale drop_prob linearly from 0.0 to 0.2
@@ -335,14 +360,14 @@ def retrain_discrete(
             labels_k = [labels[i] for i in idx_list]
 
             # ── Augmentation ─────────────────────────────────────────────────
-            # DermaMNIST (task 2): 50/50 random choice of CutMix or Mixup.
+            # DermaMNIST: 50/50 random choice of CutMix or Mixup.
             #   CutMix preserves local textures; Mixup regularises globally.
             #   Combined they improve calibration on the 7-class imbalanced set.
             # Other tasks: standard Mixup only.
-            effective_alpha = (mixup_alpha * 2.0) if (task_id == 2 and mixup_alpha > 0) else mixup_alpha
+            effective_alpha = (mixup_alpha * 2.0) if (registry_id == 2 and mixup_alpha > 0) else mixup_alpha
             use_aug = effective_alpha > 0.0 and images_k.size(0) >= 2
 
-            if use_aug and task_id == 2 and np.random.rand() < 0.5:
+            if use_aug and registry_id == 2 and np.random.rand() < 0.5:
                 # CutMix branch
                 images_k_mix, labels_k, labels_k_shuf, lam = _cutmix_batch(
                     images_k, labels_k, alpha=effective_alpha,
@@ -377,32 +402,34 @@ def retrain_discrete(
             elif use_aug:
                 # Weighted sum of CE losses for the two mixed classes.
                 loss = (
-                    lam * task_loss(logits, labels_k, task_id, device,
+                    lam * task_loss(logits, labels_k, registry_id, device,
                                     label_smoothing,
                                     use_class_weights=_use_class_weights,
                                     use_focal=_use_focal,
-                                    chest_pos_weight=_chest_pw)
-                    + (1.0 - lam) * task_loss(logits, labels_k_shuf, task_id,
+                                    chest_pos_weight=_chest_pw,
+                                    is_multilabel=is_multilabel)
+                    + (1.0 - lam) * task_loss(logits, labels_k_shuf, registry_id,
                                               device, label_smoothing,
                                               use_class_weights=_use_class_weights,
                                               use_focal=_use_focal,
-                                              chest_pos_weight=_chest_pw)
+                                              chest_pos_weight=_chest_pw,
+                                              is_multilabel=is_multilabel)
                 )
             else:
                 # DermaMNIST: use minimal label smoothing so decision
                 # boundaries stay sharp — critical for accuracy on a
                 # 7-class imbalanced dataset.
-                effective_ls = 0.02 if task_id == 2 else label_smoothing
-                loss = task_loss(logits, labels_k, task_id, device,
+                effective_ls = 0.02 if registry_id == 2 else label_smoothing
+                loss = task_loss(logits, labels_k, registry_id, device,
                                  effective_ls,
                                  use_class_weights=_use_class_weights,
                                  use_focal=_use_focal,
-                                 chest_pos_weight=_chest_pw)
+                                 chest_pos_weight=_chest_pw,
+                                 is_multilabel=is_multilabel)
 
             loss.backward()
             nn.utils.clip_grad_norm_(discrete_model.parameters(), grad_clip)
             optimizer.step()
-            _ema_model.update_parameters(discrete_model)
             epoch_loss += loss.item()
             n_batches  += 1
 
@@ -413,10 +440,10 @@ def retrain_discrete(
             _swa_model.update_parameters(discrete_model)
             _swa_updated = True
 
-        # Evaluate EMA model every epoch for fine-grained best-checkpoint selection.
+        # Evaluate discrete_model every epoch for fine-grained best-checkpoint selection.
         val_metrics = evaluate_task(
-            _ema_model, val_loader, task_id, device, is_supernet=False,
-            balanced_training=_sampler_active,
+            discrete_model, val_loader, task_id, device, is_supernet=False,
+            balanced_training=_sampler_active, registry_id=registry_id,
         )
         if epoch % 10 == 0 or epoch == num_epochs:
             avg_loss = epoch_loss / max(n_batches, 1)
@@ -428,7 +455,7 @@ def retrain_discrete(
             )
         if val_metrics["auc"] > best_val_auc:
             best_val_auc       = val_metrics["auc"]
-            best_state         = copy.deepcopy(_ema_model.module.state_dict())
+            best_state         = copy.deepcopy(discrete_model.state_dict())
             retrain_no_improve = 0
         else:
             retrain_no_improve += 1
@@ -469,9 +496,10 @@ def retrain_discrete(
 
     # ChestMNIST: calibrate per-label thresholds on val set before test eval
     # to maximise multi-label accuracy (fixed 0.5 is suboptimal with pos_weight=10).
-    if task_id == 1:
+    if registry_id == 1:
         chest_thresholds = _calibrate_chest_thresholds(
-            discrete_model, val_loader, device, n_labels=14,
+            discrete_model, val_loader, device, task_id,
+            n_labels=TASK_REGISTRY[registry_id][2],
         )
     else:
         chest_thresholds = None
@@ -481,13 +509,13 @@ def retrain_discrete(
         test_metrics = evaluate_task_tta(
             discrete_model, test_loader, task_id, device, is_supernet=False,
             chest_thresholds=chest_thresholds,
-            balanced_training=_sampler_active,
+            balanced_training=_sampler_active, registry_id=registry_id,
         )
     else:
         test_metrics = evaluate_task(
             discrete_model, test_loader, task_id, device, is_supernet=False,
             chest_thresholds=chest_thresholds,
-            balanced_training=_sampler_active,
+            balanced_training=_sampler_active, registry_id=registry_id,
         )
     logger.info(
         f"  [{task_name}] FINAL TEST"
@@ -502,9 +530,13 @@ def retrain_discrete(
         logger.info(f"  Saved best model → {path}")
 
     return {
-        "test_acc":     test_metrics["acc"],
-        "test_auc":     test_metrics["auc"],
-        "test_loss":    test_metrics["loss"],
-        "best_val_auc": best_val_auc,
-        "n_params":     n_params,
+        "test_acc":       test_metrics["acc"],
+        "test_auc":       test_metrics["auc"],
+        "test_f1":        test_metrics.get("f1",        float("nan")),
+        "test_precision": test_metrics.get("precision", float("nan")),
+        "test_recall":    test_metrics.get("recall",    float("nan")),
+        "test_loss":      test_metrics["loss"],
+        "best_val_auc":   best_val_auc,
+        "n_params":       n_params,
+        "flops_m":        flops_m,
     }

@@ -19,9 +19,7 @@ from torch import Tensor
 
 from .normalizers import annealed_sparsemax
 from .ops import MixedOp, NUM_OPS, OP_NAMES
-
-# Local mapping avoids importing data.py here (would create a circular dep).
-_TASK_NAMES: Dict[int, str] = {0: "PathMNIST", 1: "ChestMNIST", 2: "DermaMNIST"}
+# TASK_REGISTRY imported lazily inside methods to avoid circular imports.
 
 
 class TaskAwareSupernet(nn.Module):
@@ -32,9 +30,6 @@ class TaskAwareSupernet(nn.Module):
     controller applies sigmoid numerically stably.
     """
 
-    # Tasks that use multi-label (BCEWithLogitsLoss) instead of CE.
-    MULTILABEL_TASKS = {1}   # ChestMNIST
-
     def __init__(
         self,
         num_tasks:            int            = 3,
@@ -42,15 +37,42 @@ class TaskAwareSupernet(nn.Module):
         channels:             int            = 64,
         num_classes_per_task: Optional[List[int]] = None,
         img_size:             int            = 64,
+        task_ids:             Optional[List[int]] = None,
+        multilabel_tasks:     Optional[List[int]] = None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        task_ids        : Ordered list of registry task IDs used by this supernet.
+                          Length must equal num_tasks.  Defaults to [0,1,2].
+        multilabel_tasks: Registry task IDs that use BCEWithLogitsLoss.
+                          Derived from TASK_REGISTRY when None.
+        """
         super().__init__()
         self.num_tasks  = num_tasks
         self.num_layers = num_layers
         self.channels   = channels
         self.img_size   = img_size
 
+        # Resolve task ordering (index into supernet == position in task_ids).
+        from .data import TASK_REGISTRY, DEFAULT_TASK_IDS
+        _ids = task_ids if task_ids is not None else DEFAULT_TASK_IDS
+        assert len(_ids) == num_tasks, (
+            f"len(task_ids)={len(_ids)} must equal num_tasks={num_tasks}"
+        )
+        self.task_ids: List[int] = list(_ids)
+
+        # Which positions in self.task_ids use multi-label loss.
+        if multilabel_tasks is not None:
+            self.MULTILABEL_TASKS: set = set(multilabel_tasks)
+        else:
+            self.MULTILABEL_TASKS = {
+                pos for pos, tid in enumerate(self.task_ids)
+                if TASK_REGISTRY[tid][4]   # is_multilabel flag
+            }
+
         if num_classes_per_task is None:
-            num_classes_per_task = [9, 14, 7]
+            num_classes_per_task = [TASK_REGISTRY[tid][2] for tid in self.task_ids]
         assert len(num_classes_per_task) == num_tasks, (
             f"Expected {num_tasks} class counts, got {len(num_classes_per_task)}"
         )
@@ -61,8 +83,31 @@ class TaskAwareSupernet(nn.Module):
         # Gradient disentanglement (Contrib. [A]) applies at the cell level;
         # independent stems let each task learn its own low-level feature
         # extractor without cross-task interference at the pixel level.
+        #
+        # Stem design by resolution:
+        #   28px  → single 3×3 conv, no stride  (spatial kept at 28×28)
+        #   33–127px → two strided convs, ÷4    (e.g. 64 → 16px)
+        #   128px+ → three strided convs, ÷8    (e.g. 224 → 28px)
+        #
+        # The 224px path reduces spatial to ~28×28 before the cells so that
+        # cell memory cost is identical to the 28px baseline — only the stem
+        # forward pass is larger (handled with gradient checkpointing if needed).
         def _make_stem() -> nn.Sequential:
-            if img_size > 32:
+            if img_size >= 128:
+                # 224px → 112 → 56 → 28  (three stride-2 convs)
+                return nn.Sequential(
+                    nn.Conv2d(3, channels // 4, 3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(channels // 4),
+                    nn.ReLU6(inplace=True),
+                    nn.Conv2d(channels // 4, channels // 2, 3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(channels // 2),
+                    nn.ReLU6(inplace=True),
+                    nn.Conv2d(channels // 2, channels, 3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU6(inplace=True),
+                )
+            elif img_size > 32:
+                # 64px → 32 → 16  (two stride-2 convs)
                 return nn.Sequential(
                     nn.Conv2d(3, channels // 2, 3, stride=2, padding=1, bias=False),
                     nn.BatchNorm2d(channels // 2),
@@ -72,6 +117,7 @@ class TaskAwareSupernet(nn.Module):
                     nn.ReLU6(inplace=True),
                 )
             else:
+                # 28px → 28  (single conv, no stride)
                 return nn.Sequential(
                     nn.Conv2d(3, channels, 3, padding=1, bias=False),
                     nn.BatchNorm2d(channels),
@@ -98,19 +144,19 @@ class TaskAwareSupernet(nn.Module):
             self.cells.append(MixedOp(c))
 
         # ── Task-specific classification heads ────────────────────────────
-        # PathMNIST / ChestMNIST: GAP → Dropout(0.3) → FC(4C) → ReLU → Dropout(0.2) → FC(nc)
-        # DermaMNIST (task 2): deeper head with BN + extra hidden layer to
-        #   improve calibration on the 7-class imbalanced 10k dataset.
+        # Small datasets (< ~10k train samples) get a deeper head with
+        # LayerNorm + extra hidden layer for better calibration.
+        # This is determined from TASK_REGISTRY rather than hardcoded to task 2.
+        # LayerNorm is used instead of BatchNorm1d because BN crashes on
+        # single-sample micro-batches; LN works with any batch size.
+        from .data import TASK_REGISTRY
+        SMALL_DATASET_TASKS = {2, 5, 6}   # DermaMNIST, RetinaMNIST, BreastMNIST
+
         final_channels = c
         hidden_dim = max(final_channels * 4, 256)
         heads: list = []
-        for t, nc in enumerate(num_classes_per_task):
-            if t == 2:
-                # Deeper head: GAP → D(0.3) → FC(4C) → LN → ReLU → D(0.2) → FC(2C) → ReLU → D(0.1) → FC(7)
-                # LayerNorm instead of BatchNorm1d: BN crashes on single-sample
-                # micro-batches (common when task_id==2 has 1 DermaMNIST image
-                # in a given batch).  LN normalises per-feature and works with
-                # any batch size.
+        for pos, (tid, nc) in enumerate(zip(self.task_ids, num_classes_per_task)):
+            if tid in SMALL_DATASET_TASKS:
                 hidden2 = max(final_channels * 2, 128)
                 heads.append(nn.Sequential(
                     nn.AdaptiveAvgPool2d(1),
@@ -205,6 +251,11 @@ class TaskAwareSupernet(nn.Module):
         Returns a deep-copied nn.Sequential fully detached from the supernet,
         ready for stand-alone retraining.
         """
+        # task_id here is a supernet position index (0..num_tasks-1).
+        from .data import TASK_REGISTRY
+        registry_id = self.task_ids[task_id]
+        name = TASK_REGISTRY[registry_id][0]
+
         best_indices = self.alphas[task_id].argmax(dim=-1).tolist()
         discrete = nn.Sequential()
         discrete.add_module("stem", copy.deepcopy(self.stems[task_id]))
@@ -213,7 +264,6 @@ class TaskAwareSupernet(nn.Module):
                 discrete.add_module(f"downsample_{l}", copy.deepcopy(self.downsamples[l]))
             discrete.add_module(f"cell_{l}", copy.deepcopy(self.cells[l].ops[idx]))
         discrete.add_module("head", copy.deepcopy(self.heads[task_id]))
-        name = _TASK_NAMES.get(task_id, str(task_id))
         print(f"\n[discretize] Task {task_id} ({name}):")
         for l, idx in enumerate(best_indices):
             print(f"  Layer {l:2d} → {OP_NAMES[idx]}")

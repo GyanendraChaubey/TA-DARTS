@@ -106,6 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Input resolution: 28 | 64 | 128 (64 recommended)")
     g3.add_argument("--search-micro-batch", type=int, default=0,
                     help="Micro-batch size used only during search steps (0 = full batch)")
+    g3.add_argument("--tasks",          type=str,   default="0,1,2",
+                    help="Comma-separated task IDs to run, e.g. '0,1,2' (3 tasks) "
+                         "or '0,1,2,3,4,5,6,7,8,9,10,11' (all 12). "
+                         "See TASK_REGISTRY in src/data.py for the full list.")
 
     return parser
 
@@ -120,6 +124,10 @@ if __name__ == "__main__":
             "scikit-learn not installed — AUC metrics will be NaN. "
             "Install with: pip install scikit-learn"
         )
+
+    # Parse --tasks into a sorted list of ints.
+    task_ids = sorted(int(t.strip()) for t in args.tasks.split(",") if t.strip())
+    logger.info(f"Active tasks: {task_ids}")
 
     # Apply ablation overrides before passing to run_search.
     tau_init_eff      = args.tau_init
@@ -162,4 +170,5 @@ if __name__ == "__main__":
         label_smoothing   = args.label_smoothing,
         search_micro_batch= args.search_micro_batch,
         use_tta           = args.tta,
+        task_ids          = task_ids,
     )

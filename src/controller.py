@@ -18,7 +18,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .data import MedMNISTDataset
 from .losses import task_loss
 from .normalizers import annealed_sparsemax
 from .supernet import TaskAwareSupernet
@@ -55,12 +54,13 @@ class SearchController:
         grad_clip:         float = 5.0,
         eta_min:           float = 1e-4,
         tau_init:          float = 1.5,
-        anneal_factor:     float = 0.90,
-        anneal_interval:   int   = 3,
+        anneal_factor:     float = 0.95,   # fixed: 0.90 caused premature collapse
+        anneal_interval:   int   = 5,      # fixed: 3 dropped tau too fast
         tau_min:           float = 0.30,
         alpha_update_freq: int   = 10,
         search_micro_batch:int   = 0,
         label_smoothing:   float = 0.0,
+        arch_reg_lambda:   float = 0.01,   # entropy regularisation strength
     ) -> None:
         self.model             = model
         self.grad_clip         = grad_clip
@@ -81,6 +81,12 @@ class SearchController:
 
         # Label smoothing for CE tasks during search
         self.label_smoothing   = label_smoothing
+
+        # Architecture entropy regularisation — penalises low-entropy alpha
+        # distributions to prevent any single op (including ResidualBN)
+        # from dominating all layers.  λ=0.01 is mild; increase to 0.05 if
+        # ResidualBN dominance is still observed after a full run.
+        self.arch_reg_lambda   = arch_reg_lambda
 
         self.opt_weights = torch.optim.AdamW(
             model.weight_parameters(),
@@ -127,14 +133,36 @@ class SearchController:
                         for i in mask.nonzero(as_tuple=True)[0].tolist()]
             # Contrib. [A][B]: forward with current annealed tau
             logits_k = self.model(imgs_k, k, tau=self._current_tau)
-            loss_k   = task_loss(logits_k, labels_k, k, device,
-                                 self.label_smoothing)
+            registry_id = self.model.task_ids[k]
+            loss_k   = task_loss(logits_k, labels_k, registry_id, device,
+                                 self.label_smoothing,
+                                 is_multilabel=(k in self.model.MULTILABEL_TASKS))
             task_losses.append(loss_k)
 
-        if task_losses:
-            # Equal-weight mean across tasks (not across samples).
-            return sum(task_losses) / len(task_losses)
-        return torch.tensor(0.0, device=device)
+        if not task_losses:
+            return torch.tensor(0.0, device=device)
+
+        # Equal-weight mean across tasks (not across samples).
+        task_loss_mean = sum(task_losses) / len(task_losses)
+
+        # ── Architecture entropy regularisation ───────────────────────────────
+        # Maximise entropy of sparsemax(α) across all tasks and layers.
+        # This penalises low-entropy (op-dominated) distributions, preventing
+        # any single op — including ResidualBN — from collapsing the search.
+        #
+        #   L_total = L_task  −  λ · H(sparsemax(α))
+        #
+        # The minus sign is because we MINIMISE the total loss, so subtracting
+        # entropy is equivalent to maximising it.
+        # Only applied when lambda > 0 to allow easy ablation (set to 0.0).
+        if self.arch_reg_lambda > 0.0:
+            soft = annealed_sparsemax(self.model.alphas, tau=self._current_tau)
+            # Clamp to avoid log(0); sparsemax can produce exact zeros.
+            entropy = -(soft * soft.clamp(min=1e-9).log()).sum(dim=-1).mean()
+            arch_reg = -self.arch_reg_lambda * entropy
+            return task_loss_mean + arch_reg
+
+        return task_loss_mean
 
     def _run_microbatched_backward(
         self,
@@ -304,12 +332,13 @@ class SearchController:
         os.makedirs(ckpt_dir, exist_ok=True)
         path = os.path.join(ckpt_dir, f"mt_darts_{tag}.pt")
         torch.save({
-            "epoch":       epoch,
-            "step":        self._step,
-            "model_state": self.model.state_dict(),
-            "opt_weights": self.opt_weights.state_dict(),
-            "opt_arch":    self.opt_arch.state_dict(),
-            "scheduler":   self.scheduler.state_dict(),
+            "epoch":            epoch,
+            "step":             self._step,
+            "model_state":      self.model.state_dict(),
+            "opt_weights":      self.opt_weights.state_dict(),
+            "opt_arch":         self.opt_arch.state_dict(),
+            "scheduler":        self.scheduler.state_dict(),
+            "arch_reg_lambda":  self.arch_reg_lambda,
             "current_tau": self._current_tau,
         }, path)
         logger.info(f"  [ckpt] Saved → {path}")
@@ -322,8 +351,9 @@ class SearchController:
         self.opt_weights.load_state_dict(ckpt["opt_weights"])
         self.opt_arch.load_state_dict(ckpt["opt_arch"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
-        self._step        = ckpt["step"]
-        self._current_tau = ckpt.get("current_tau", self.tau_init)
+        self._step             = ckpt["step"]
+        self._current_tau      = ckpt.get("current_tau", self.tau_init)
+        self.arch_reg_lambda   = ckpt.get("arch_reg_lambda", self.arch_reg_lambda)
         logger.info(
             f"  [ckpt] Resumed from {path} "
             f"(epoch {ckpt['epoch']}, τ={self._current_tau:.4f})"
@@ -336,6 +366,7 @@ class SearchController:
     def log_arch_distribution(self) -> None:
         """Log the current sparsemax architecture weights for all tasks."""
         from .ops import OP_NAMES  # local import avoids top-level cycle
+        from .data import TASK_REGISTRY
 
         logger.info(
             f"\n[step {self._step}] Architecture distribution "
@@ -344,7 +375,8 @@ class SearchController:
         )
         soft = annealed_sparsemax(self.model.alphas, tau=self._current_tau)
         for t in range(self.num_tasks):
-            name = MedMNISTDataset.TASK_NAMES.get(t, f"Task{t}")
+            registry_id = self.model.task_ids[t]
+            name = TASK_REGISTRY.get(registry_id, (f"Task{t}",))[0]
             logger.info(f"  {name}:")
             for lay in range(self.model.num_layers):
                 probs    = soft[t, lay].tolist()

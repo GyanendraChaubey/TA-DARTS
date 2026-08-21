@@ -1,7 +1,7 @@
 """
 Evaluation metrics for MT-DARTS v2.
 
-  evaluate_task()  — per-task acc + AUC + loss (supernet or discrete model).
+  evaluate_task()  — per-task acc + AUC + F1 + precision + recall + loss.
   evaluate()       — all-task evaluation returning a dict of metrics.
   alpha_entropy()  — mean Shannon entropy of sparsemax(α) for [D] early stop.
 """
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from .data import MedMNISTDataset
+from .data import TASK_REGISTRY
 from .losses import task_loss
 from .normalizers import annealed_sparsemax
 from .supernet import TaskAwareSupernet
@@ -26,13 +26,46 @@ logger = logging.getLogger("MT-DARTS")
 
 # ── Optional sklearn ──────────────────────────────────────────────────────────
 try:
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import (
+        roc_auc_score,
+        f1_score,
+        precision_score,
+        recall_score,
+    )
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
 
 
 # ── AUC helper ────────────────────────────────────────────────────────────────
+
+def _safe_clf_metrics(
+    y_true:       np.ndarray,
+    y_pred:       np.ndarray,
+    is_multilabel: bool,
+) -> Dict[str, float]:
+    """
+    Compute macro-averaged F1, precision, and recall with graceful fallback.
+
+    For multi-label tasks (ChestMNIST) uses sample-averaged F1/P/R which is
+    standard for multi-label evaluation, then also reports macro.
+    For single-label tasks reports macro-averaged scores.
+    Returns NaN for each metric when sklearn is absent or data is degenerate.
+    """
+    if not HAS_SKLEARN:
+        return {"f1": float("nan"), "precision": float("nan"), "recall": float("nan")}
+    try:
+        avg = "macro"
+        kw  = dict(average=avg, zero_division=0)
+        return {
+            "f1":        float(f1_score(y_true, y_pred, **kw)),
+            "precision": float(precision_score(y_true, y_pred, **kw)),
+            "recall":    float(recall_score(y_true, y_pred, **kw)),
+        }
+    except Exception as exc:
+        logger.warning(f"F1/P/R computation failed: {exc}")
+        return {"f1": float("nan"), "precision": float("nan"), "recall": float("nan")}
+
 
 def _safe_auc(
     y_true:       np.ndarray,
@@ -79,6 +112,7 @@ def evaluate_task(
     is_supernet:            bool = True,
     chest_thresholds:       "Optional[np.ndarray]" = None,
     balanced_training:      bool = False,
+    registry_id:            Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Evaluate ``model`` on samples belonging to ``task_id`` in ``loader``.
@@ -88,7 +122,9 @@ def evaluate_task(
     Args:
         model              : Supernet (is_supernet=True) or discrete nn.Sequential.
         loader             : Mixed-task DataLoader (collate_fn from MedMNISTDataset).
-        task_id            : Which task to filter and evaluate.
+        task_id            : Position of the task to filter/evaluate — matches
+                             the per-sample task labels produced by the
+                             DataLoader and the index used to call the supernet.
         device             : Compute device.
         is_supernet        : If True call model(imgs, task_id); else call model(imgs).
         chest_thresholds   : Optional (14,) array of per-label thresholds for
@@ -98,13 +134,19 @@ def evaluate_task(
                              DermaMNIST ACC prior correction from dividing by prior
                              (correct for imbalanced training) to multiplying by
                              prior (correct for balanced training).
+        registry_id        : The task's registry id (see TASK_REGISTRY in
+                             src/data.py), used to resolve n_classes/is_multilabel
+                             and to gate the DermaMNIST-specific ACC correction.
+                             Defaults to ``task_id`` for backward compatibility
+                             with the default 3-task ordering (position == id).
 
     Returns:
         {"acc": float, "auc": float, "loss": float, "n": int}
     """
     model.eval()
-    is_ml     = task_id in TaskAwareSupernet.MULTILABEL_TASKS
-    n_classes = MedMNISTDataset.NUM_CLASSES[task_id]
+    _reg_id   = task_id if registry_id is None else registry_id
+    is_ml     = TASK_REGISTRY[_reg_id][4]
+    n_classes = TASK_REGISTRY[_reg_id][2]
 
     all_scores: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
@@ -123,7 +165,7 @@ def evaluate_task(
                     for i in mask.nonzero(as_tuple=True)[0].tolist()]
 
         logits = model(imgs_k, task_id) if is_supernet else model(imgs_k)
-        loss   = task_loss(logits, labels_k, task_id, device)
+        loss   = task_loss(logits, labels_k, _reg_id, device, is_multilabel=is_ml)
         total_loss += loss.item()
         n_batches  += 1
 
@@ -161,7 +203,7 @@ def evaluate_task(
         acc    = float(np.mean(y_pred == y_true))
     else:
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
-        if task_id == 2 and not is_supernet:
+        if _reg_id == 2 and not is_supernet:
             # Prior-probability correction for DermaMNIST ACC.
             # Only applied to a fully-trained discrete model (is_supernet=False).
             # During search the supernet outputs near-uniform softmax; the
@@ -173,7 +215,7 @@ def evaluate_task(
             #   Balanced training (WeightedRandomSampler) → model outputs are
             #     already calibrated under a uniform prior → multiply by true
             #     prior to match the test-set distribution for optimal argmax.
-            _n_cls  = MedMNISTDataset.NUM_CLASSES[2]  # 7
+            _n_cls  = n_classes  # 7
             _counts = np.bincount(
                 y_true_flat.astype(int), minlength=_n_cls
             ).astype(np.float64)
@@ -191,9 +233,17 @@ def evaluate_task(
             y_pred = np.argmax(y_score, axis=-1)
         acc         = float(np.mean(y_pred == y_true_flat))
 
-    auc = _safe_auc(y_true, y_score, is_ml, n_classes)
-    return {"acc": acc, "auc": auc, "loss": float(avg_loss),
-            "n": int(y_true.shape[0])}
+    auc     = _safe_auc(y_true, y_score, is_ml, n_classes)
+    clf     = _safe_clf_metrics(y_true, y_pred, is_ml)
+    return {
+        "acc":       acc,
+        "auc":       auc,
+        "f1":        clf["f1"],
+        "precision": clf["precision"],
+        "recall":    clf["recall"],
+        "loss":      float(avg_loss),
+        "n":         int(y_true.shape[0]),
+    }
 
 
 # ── All-task evaluation ───────────────────────────────────────────────────────
@@ -213,12 +263,17 @@ def evaluate(
     """
     results: Dict[int, Dict[str, float]] = {}
     for k in range(model.num_tasks):
-        metrics = evaluate_task(model, loader, k, device, is_supernet=True)
-        name    = MedMNISTDataset.TASK_NAMES.get(k, f"Task{k}")
+        registry_id = model.task_ids[k]
+        metrics = evaluate_task(model, loader, k, device, is_supernet=True,
+                                 registry_id=registry_id)
+        name    = TASK_REGISTRY.get(registry_id, (f"Task{k}",))[0]
         logger.info(
             f"  [{split_name}] {name:12s}"
             f"  ACC={metrics['acc']:.4f}"
             f"  AUC={metrics['auc']:.4f}"
+            f"  F1={metrics.get('f1', float('nan')):.4f}"
+            f"  P={metrics.get('precision', float('nan')):.4f}"
+            f"  R={metrics.get('recall', float('nan')):.4f}"
             f"  Loss={metrics['loss']:.4f}"
             f"  (n={metrics['n']})"
         )
@@ -238,6 +293,7 @@ def evaluate_task_tta(
     n_tta:             int                     = 8,
     chest_thresholds:  "Optional[np.ndarray]"  = None,
     balanced_training: bool                    = False,
+    registry_id:       Optional[int]           = None,
 ) -> Dict[str, float]:
     """
     Evaluate ``model`` with test-time augmentation (TTA).
@@ -250,13 +306,15 @@ def evaluate_task_tta(
     Args:
         model             : Discrete model (is_supernet=False) or supernet.
         loader            : Mixed-task DataLoader.
-        task_id           : Which task to filter and evaluate.
+        task_id           : Position of the task to filter/evaluate.
         device            : Compute device.
         is_supernet       : If True call model(imgs, task_id); else model(imgs).
         n_tta             : Number of augmented views to average (default 8).
         chest_thresholds  : Optional per-label thresholds for ChestMNIST ACC.
         balanced_training : Passed through to :func:`evaluate_task` to control
                             the direction of the DermaMNIST prior correction.
+        registry_id       : The task's registry id — see :func:`evaluate_task`.
+                            Defaults to ``task_id``.
 
     Returns:
         {"acc": float, "auc": float, "loss": float, "n": int}
@@ -264,8 +322,9 @@ def evaluate_task_tta(
     import torchvision.transforms.functional as TF
 
     model.eval()
-    is_ml     = task_id in TaskAwareSupernet.MULTILABEL_TASKS
-    n_classes = MedMNISTDataset.NUM_CLASSES[task_id]
+    _reg_id   = task_id if registry_id is None else registry_id
+    is_ml     = TASK_REGISTRY[_reg_id][4]
+    n_classes = TASK_REGISTRY[_reg_id][2]
 
     all_scores: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
@@ -313,7 +372,7 @@ def evaluate_task_tta(
 
         # Compute loss on the original (non-augmented) images for reference.
         orig_logits = model(imgs_k, task_id) if is_supernet else model(imgs_k)
-        loss = task_loss(orig_logits, labels_k, task_id, device)
+        loss = task_loss(orig_logits, labels_k, _reg_id, device, is_multilabel=is_ml)
         total_loss += loss.item()
         n_batches  += 1
 
@@ -347,8 +406,8 @@ def evaluate_task_tta(
         acc = float(np.mean(y_pred == y_true))
     else:
         y_true_flat = y_true.squeeze() if y_true.ndim > 1 else y_true
-        if task_id == 2 and not is_supernet:
-            _n_cls  = MedMNISTDataset.NUM_CLASSES[2]
+        if _reg_id == 2 and not is_supernet:
+            _n_cls  = n_classes
             _counts = np.bincount(
                 y_true_flat.astype(int), minlength=_n_cls
             ).astype(np.float64)
@@ -363,9 +422,17 @@ def evaluate_task_tta(
             y_pred = np.argmax(y_score, axis=-1)
         acc = float(np.mean(y_pred == y_true_flat))
 
-    auc = _safe_auc(y_true, y_score, is_ml, n_classes)
-    return {"acc": acc, "auc": auc, "loss": float(avg_loss),
-            "n": int(y_true.shape[0])}
+    auc     = _safe_auc(y_true, y_score, is_ml, n_classes)
+    clf     = _safe_clf_metrics(y_true, y_pred, is_ml)
+    return {
+        "acc":       acc,
+        "auc":       auc,
+        "f1":        clf["f1"],
+        "precision": clf["precision"],
+        "recall":    clf["recall"],
+        "loss":      float(avg_loss),
+        "n":         int(y_true.shape[0]),
+    }
 
 
 # ── Alpha entropy (early stopping signal) ────────────────────────────────────

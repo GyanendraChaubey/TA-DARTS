@@ -2,7 +2,14 @@
 Primitive operations for the 10-op search space, plus MixedOp.
 
 Search space:  MBConv3x3 | MBConv5x5 | MBConvSE | DilatedConv3x3 | DilatedConv5x5
-             | SepConv3x3 | SepConv5x5 | SkipConnect | AvgPool3x3 | MaxPool3x3
+             | SepConv3x3 | SepConv5x5 | ResidualBN | AvgPool3x3 | MaxPool3x3
+
+Note on ResidualBN (replaces SkipConnect):
+  Pure identity (SkipConnect) caused NAS collapse — the search consistently
+  assigned near-all weight to skip ops because they never increase training loss.
+  ResidualBN = identity + BatchNorm preserves the near-skip shortcut path while
+  forcing the NAS to learn a meaningful normalisation at every layer, breaking
+  the zero-cost incentive that drives skip dominance.
 
 Note: Zero was removed from the search space. In a sequential chain architecture
 a Zero op kills all downstream gradient flow; AvgPool3x3 is the replacement.
@@ -231,9 +238,23 @@ class SepConv5x5(nn.Module):
         return out + x
 
 
-class SkipConnect(nn.Module):
+class ResidualBN(nn.Module):
+    """
+    Identity shortcut + BatchNorm (replaces SkipConnect).
+
+    Pure SkipConnect has zero training cost, so sparsemax always collapses
+    toward it regardless of task.  Adding BatchNorm introduces learnable
+    parameters (γ, β) and running statistics that must be optimised, giving
+    the search a real signal to weigh this op against others.
+
+    Forward: out = BN(x) + x  (residual form keeps the shortcut path open)
+    """
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.bn = nn.BatchNorm2d(channels)
+
     def forward(self, x: Tensor) -> Tensor:
-        return x
+        return self.bn(x) + x
 
 
 class AvgPool3x3(nn.Module):
@@ -276,7 +297,7 @@ OP_NAMES: List[str] = [
     "DilatedConv5x5",
     "SepConv3x3",
     "SepConv5x5",
-    "SkipConnect",
+    "ResidualBN",      # replaces SkipConnect — see module docstring
     "AvgPool3x3",
     "MaxPool3x3",
 ]
@@ -290,7 +311,7 @@ _OP_REGISTRY = {
     "DilatedConv5x5": DilatedConv5x5,
     "SepConv3x3":     SepConv3x3,
     "SepConv5x5":     SepConv5x5,
-    "SkipConnect":    lambda c: SkipConnect(),
+    "ResidualBN":     ResidualBN,
     "AvgPool3x3":     AvgPool3x3,
     "MaxPool3x3":     MaxPool3x3,
 }

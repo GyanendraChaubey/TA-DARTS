@@ -12,8 +12,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .supernet import TaskAwareSupernet
-
 # ── Per-task class weights ────────────────────────────────────────────────────
 # DermaMNIST (task 2) class distribution from MedMNIST v2 official train split
 # (7,007 samples total):
@@ -86,11 +84,12 @@ def task_loss(
     use_class_weights: bool             = True,
     use_focal:         bool             = False,
     chest_pos_weight:  Optional[Tensor] = None,
+    is_multilabel:     bool             = False,
 ) -> Tensor:
     """
     Route to the correct loss function per task.
 
-    Multi-label tasks (ChestMNIST, task_id in MULTILABEL_TASKS):
+    Multi-label tasks (ChestMNIST, is_multilabel=True):
         BCEWithLogitsLoss — sigmoid applied internally for numerical stability.
         Labels must be float multi-hot vectors. label_smoothing not applied.
         pos_weight applied to reweight sparse positive labels.
@@ -109,7 +108,11 @@ def task_loss(
     Args:
         logits             : Model output, shape (B, num_classes).
         labels             : Ground-truth — a scalar int, a tensor, or a list.
-        task_id            : Determines loss function and label dtype.
+        task_id            : The task's *registry* id (see TASK_REGISTRY in
+                             src/data.py) — NOT its position in a custom
+                             --tasks selection.  Only gates the DermaMNIST-
+                             specific class weights/focal loss below
+                             (registry id 2).
         device             : Target device for label tensors.
         label_smoothing    : Smoothing factor for CE tasks (0 = disabled).
         use_class_weights  : If False, disable per-class weights even for
@@ -119,8 +122,11 @@ def task_loss(
                              plain CE for DermaMNIST hard-example mining.
         chest_pos_weight   : Per-label pos_weight tensor for ChestMNIST (14,).
                              Overrides the static _CHEST_POS_WEIGHT when given.
+        is_multilabel      : Whether this task uses multi-label (BCE) loss
+                             instead of single-label (CE).  Caller resolves
+                             this from TASK_REGISTRY / model.MULTILABEL_TASKS.
     """
-    if task_id in TaskAwareSupernet.MULTILABEL_TASKS:
+    if is_multilabel:
         if isinstance(labels, Tensor):
             lbl_t = labels.to(device)
         elif isinstance(labels, list):
