@@ -235,9 +235,7 @@ src/
 
 ## Documentation
 
-- [paper/docs/architecture.md](paper/docs/architecture.md) — full technical
-  reference (ops, supernet, bilevel search, retrain protocol, hyperparameters).
-  Written for the original 3-task/SkipConnect setup — some details (op names,
-  anneal defaults) predate this README and are being updated separately.
-- [paper/docs/explainer.md](paper/docs/explainer.md) — plain-English
-  walkthrough with no equations. Same caveat as above.
+Two deeper reference docs (`paper/docs/architecture.md` — full technical
+reference; `paper/docs/explainer.md` — plain-English walkthrough) exist
+locally but `paper/` is git-ignored, so they aren't part of this repository
+and won't be present after a fresh clone.
