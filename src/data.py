@@ -232,8 +232,15 @@ class MedMNISTDataset(Dataset):
                 else:                     # (H, W, C) → (C, H, W)
                     t = t.permute(2, 0, 1)
                 img = t
-                if self.IS_GRAYSCALE[task_id]:
-                    img = img.mean(dim=0, keepdim=True).repeat(3, 1, 1)
+                # `as_rgb=True` above only affects the dataset's own
+                # __getitem__ (PIL path) — it does NOT touch the raw
+                # `ds.imgs` array we read here, so natively single-channel
+                # sources (e.g. ChestMNIST's X-rays) still arrive as (1,H,W)
+                # even though TASK_REGISTRY's is_grayscale flag says False
+                # for them. Expand to 3 channels whenever the array actually
+                # came out single-channel, rather than trusting that flag.
+                if img.shape[0] == 1:
+                    img = img.repeat(3, 1, 1)
 
                 if self.IS_MULTILABEL[task_id]:
                     lbl = torch.from_numpy(lbl_np.flatten().astype("float32"))

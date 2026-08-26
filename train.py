@@ -64,6 +64,11 @@ def run_search(
     entropy_threshold: float = 0.05,
     auc_patience:      int   = 15,
     rewind_thresh:     float = 0.10,
+    # ── Ablation knobs ────────────────────────────────────────────────────────
+    use_sparsemax:     bool  = True,
+    task_normalize:    bool  = True,
+    arch_reg_lambda:   float = 0.01,
+    balance_tasks:     bool  = True,
     # ── Infrastructure ──────────────────────────────────────────────────────
     ckpt_dir:          str          = "checkpoints",
     save_dir:          str          = "./results",
@@ -118,6 +123,7 @@ def run_search(
         seed=seed,
         img_size=img_size,
         task_ids=_task_ids,
+        balance_tasks=balance_tasks,
     )
 
     # ── Model & controller ────────────────────────────────────────────────────
@@ -127,6 +133,7 @@ def run_search(
         channels=channels,
         img_size=img_size,
         task_ids=_task_ids,
+        use_sparsemax=use_sparsemax,
     ).to(device)
 
     controller = SearchController(
@@ -141,6 +148,9 @@ def run_search(
         alpha_update_freq=alpha_update_freq,
         label_smoothing=label_smoothing,
         search_micro_batch=search_micro_batch,
+        arch_reg_lambda=arch_reg_lambda,
+        use_sparsemax=use_sparsemax,
+        task_normalize=task_normalize,
     )
 
     start_epoch = 1
@@ -164,6 +174,12 @@ def run_search(
     logger.info(
         f"  alpha_update_freq={alpha_update_freq}"
         f"  entropy_threshold={entropy_threshold}"
+    )
+    logger.info(
+        f"  [ablation] use_sparsemax={use_sparsemax}"
+        f"  task_normalize={task_normalize}"
+        f"  arch_reg_lambda={arch_reg_lambda}"
+        f"  balance_tasks={balance_tasks}"
     )
     logger.info("=" * 72)
 
@@ -342,8 +358,7 @@ def run_search(
                 save_dir, f"architecture_epoch{epoch:03d}.txt"
             )
             with open(epoch_arch_path, "w") as _af:
-                from src.normalizers import annealed_sparsemax as _sp_ep
-                _soft_ep = _sp_ep(
+                _soft_ep = controller._alpha_normalizer(
                     model.alphas.detach(), tau=controller._current_tau
                 )
                 for _t in range(model.num_tasks):
@@ -402,8 +417,7 @@ def run_search(
     # ── Save per-task architecture snapshot to file (Fix 6) ───────────────────
     arch_snapshot_path = os.path.join(save_dir, "architecture_snapshot.txt")
     with open(arch_snapshot_path, "w") as f:
-        from src.normalizers import annealed_sparsemax as _sp
-        _soft = _sp(best_alphas, tau=best_tau)
+        _soft = controller._alpha_normalizer(best_alphas, tau=best_tau)
         for t in range(model.num_tasks):
             tname = task_names.get(t, f"Task{t}")
             best  = best_alphas[t].argmax(dim=-1).tolist()

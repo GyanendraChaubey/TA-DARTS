@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .normalizers import annealed_sparsemax
+from .normalizers import annealed_sparsemax, annealed_softmax
 from .ops import MixedOp, NUM_OPS, OP_NAMES
 # TASK_REGISTRY imported lazily inside methods to avoid circular imports.
 
@@ -39,6 +39,7 @@ class TaskAwareSupernet(nn.Module):
         img_size:             int            = 64,
         task_ids:             Optional[List[int]] = None,
         multilabel_tasks:     Optional[List[int]] = None,
+        use_sparsemax:        bool           = True,
     ) -> None:
         """
         Parameters
@@ -47,12 +48,18 @@ class TaskAwareSupernet(nn.Module):
                           Length must equal num_tasks.  Defaults to [0,1,2].
         multilabel_tasks: Registry task IDs that use BCEWithLogitsLoss.
                           Derived from TASK_REGISTRY when None.
+        use_sparsemax   : If True (default), operation weights are computed with
+                          annealed sparsemax (contrib. [A][B]). If False, uses
+                          annealed softmax instead — for the sparsemax-vs-softmax
+                          ablation (never produces exact-zero op weights).
         """
         super().__init__()
         self.num_tasks  = num_tasks
         self.num_layers = num_layers
         self.channels   = channels
         self.img_size   = img_size
+        self.use_sparsemax = use_sparsemax
+        self._alpha_normalizer = annealed_sparsemax if use_sparsemax else annealed_softmax
 
         # Resolve task ordering (index into supernet == position in task_ids).
         from .data import TASK_REGISTRY, DEFAULT_TASK_IDS
@@ -215,16 +222,17 @@ class TaskAwareSupernet(nn.Module):
         """
         Forward pass for one task.
 
-        Contrib. [A][B]: Uses annealed_sparsemax (not softmax) to produce
-        sparse, temperature-sharpened operation weights.
+        Contrib. [A][B]: Uses ``self._alpha_normalizer`` — annealed sparsemax
+        by default, or annealed softmax when ``use_sparsemax=False`` (ablation) —
+        to produce temperature-sharpened operation weights.
 
         Args:
             x       : Input images, shape (B, 3, H, W).
             task_id : Which task head + alpha row to use.
-            tau     : Current sparsemax temperature (decreasing over epochs).
+            tau     : Current temperature (decreasing over epochs).
         """
-        task_alphas       = self.alphas[task_id]                      # (L, O)
-        weights_per_layer = annealed_sparsemax(task_alphas, tau=tau)  # (L, O)
+        task_alphas       = self.alphas[task_id]                        # (L, O)
+        weights_per_layer = self._alpha_normalizer(task_alphas, tau=tau)  # (L, O)
 
         x = self.stems[task_id](x)
         for i, cell in enumerate(self.cells):

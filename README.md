@@ -47,7 +47,6 @@ python main.py \
   --layers 8 \
   --batch 64 \
   --img-size 64 \
-  --tta \
   --tau_min 0.25 \
   --device cuda \
   --seed 42 \
@@ -179,9 +178,18 @@ generalises better — typical gain of 0.5–1.0% AUC at zero extra compute.
 | `--retrain_epochs`  | 200     | Max epochs for discrete model retraining      |
 | `--alpha_freq`      | 10      | Update alpha every N weight steps             |
 | `--entropy_thresh`  | 0.05    | Early-stop when architecture entropy < this   |
-| `--tta`             | off     | 8-view test-time augmentation ensemble        |
+| `--tta`             | off     | 8-view test-time augmentation ensemble — measured *worse* than plain eval on this benchmark (see note below); leave off unless re-validated |
 | `--channels`        | 128     | Feature channel width                         |
 | `--img-size`        | 28      | Input resolution: 28 \| 64 \| 128 (64 recommended) |
+
+> **Note on `--tta`:** every one of the 8 TTA views in `evaluate_task_tta`
+> (src/metrics.py) applies a 90%-scale crop before resizing back up — none of
+> the 8 views evaluates the clean, uncropped image. Retraining never used a
+> matching random-resized-crop augmentation, so all 8 views are
+> out-of-distribution relative to training and TTA measurably *hurts*
+> results (PathMNIST: 90.33%→86.06% ACC, 0.8732→0.8188 F1, confirmed by
+> re-running both paths against the same checkpoint). Benchmark numbers in
+> `results/` are from plain (non-TTA) eval.
 
 > **Note on `--anneal_factor`/`--anneal_interval`:** earlier values of
 > `0.90`/`3` decayed tau too fast and collapsed the architecture search
@@ -209,6 +217,40 @@ generalises better — typical gain of 0.5–1.0% AUC at zero extra compute.
 
 ---
 
+## Ablation studies
+
+`scripts/run_ablations.py` runs the real Phase A→D pipeline once per
+ablation variant — sparsemax vs softmax, temperature annealing on/off,
+alpha-update frequency `{1,5,10,20}`, entropy early stopping on/off,
+task-balanced sampling on/off, architecture entropy regularisation on/off,
+plus Mixup/label-smoothing/task-normalisation on/off — and saves everything
+under `results/ablations/`. One command runs and saves the whole suite:
+
+```bash
+python scripts/run_ablations.py --epochs 50 --retrain-epochs 200 --device cuda
+```
+
+(For a quick local check instead of a full paper-matching run, use
+`--no-real --epochs 2 --retrain-epochs 2 --device cpu`.)
+
+`results/ablations/` and `checkpoints/ablations/` are created automatically
+and are separate from the main `results/`/`checkpoints/` — nothing from a
+normal run is touched. Each variant gets its own
+`results/ablations/<variant_name>/` (full output, same schema as a normal
+run), and the sweep as a whole produces:
+
+| Path                                          | Contents                                              |
+|------------------------------------------------|--------------------------------------------------------|
+| `results/ablations/ablation_summary.json`     | Per-variant AUC/ACC/F1/params/timing + deltas vs. baseline |
+| `results/ablations/ablation_summary.txt`      | Human-readable comparison table                       |
+
+Re-running the same command later skips any variant whose results already
+exist (pass `--force-rerun` to redo them). Search-space topology variants
+and shared-vs-per-task alpha tensors aren't covered — both need real
+architecture changes rather than a parameter toggle.
+
+---
+
 ## Project structure
 
 ```
@@ -220,15 +262,21 @@ src/
   controller.py      SearchController (bilevel optimiser, tau annealing,
                       entropy regularisation)
   ops.py             10 candidate operations + MixedOp
-  normalizers.py     sparsemax / annealed_sparsemax
+  normalizers.py     sparsemax / annealed_sparsemax / annealed_softmax
   data.py            TASK_REGISTRY (12 MedMNIST tasks) + MedMNISTDataset +
                       DataLoader builder
   losses.py          CE/Focal (single-label) / BCE+per-label-weights (multi-label)
   retrain.py         Discrete model retraining with Mixup/CutMix, SWA, warm
                       restarts, FLOPs profiling
   metrics.py         ACC, AUC, F1, precision, recall, alpha entropy
-  reporting.py       ASCII table + JSON report writer
+  reporting.py       ASCII table + JSON report writer; ablation comparison
+                      table/summary writer
   utils.py           set_seed, _make_divisible
+scripts/
+  run_ablations.py            Ablation-suite orchestrator (see Ablation studies)
+  regenerate_report.py        Re-score existing checkpoints without retraining
+  profile_resnet18_baseline.py  Independent FLOPs profiling for baselines
+  chest_per_label_f1.py       ChestMNIST per-label F1 breakdown
 ```
 
 ---

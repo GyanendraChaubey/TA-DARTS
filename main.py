@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from typing import Any, Dict
 
 logger = logging.getLogger("MT-DARTS")
 
@@ -69,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[D] Stop if mean AUC does not improve for this many epochs")
     g.add_argument("--rewind_thresh",   type=float, default=0.10,
                    help="[D] Rewind alphas to best if mean AUC drops by this fraction")
+    g.add_argument("--alpha-normalizer", type=str, default="sparsemax",
+                   choices=["sparsemax", "softmax"],
+                   help="[Ablation] Operation-weight normaliser used in the forward "
+                        "pass and entropy term")
+    g.add_argument("--arch-reg-lambda", type=float, default=0.01,
+                   help="Architecture entropy regularisation strength (0 = disabled)")
 
     g2 = parser.add_argument_group("Retrain Phase")
     g2.add_argument("--retrain_epochs", type=int,   default=200,
@@ -88,6 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="[Ablation] Disable [C] delayed alpha updates: update alphas every weight step")
     g2.add_argument("--no-contrib-d",   action="store_true",
                     help="[Ablation] Disable [D] entropy early stopping: run all epochs unconditionally")
+    g2.add_argument("--no-task-normalize", action="store_true",
+                    help="[Ablation] Disable task-normalised loss averaging: use "
+                         "sample-count-weighted mean instead")
 
     g3 = parser.add_argument_group("Infrastructure")
     g3.add_argument("--device",         type=str,   default="cpu",
@@ -99,6 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to checkpoint to resume from")
     g3.add_argument("--no-real",        action="store_true",
                     help="Force mock data even if medmnist is installed")
+    g3.add_argument("--no-task-balance", action="store_true",
+                    help="[Ablation] Disable task-balanced sampling: use plain shuffled sampling")
     g3.add_argument("--seed",           type=int,   default=42)
     g3.add_argument("--workers",        type=int,   default=0,
                     help="DataLoader num_workers")
@@ -112,6 +124,36 @@ def build_parser() -> argparse.ArgumentParser:
                          "See TASK_REGISTRY in src/data.py for the full list.")
 
     return parser
+
+
+def apply_ablation_overrides(
+    tau_init:        float,
+    anneal_factor:   float,
+    anneal_interval: int,
+    tau_min:         float,
+    alpha_freq:      int,
+    entropy_thresh:  float,
+    auc_patience:    int,
+    no_contrib_b:    bool,
+    no_contrib_c:    bool,
+    no_contrib_d:    bool,
+) -> Dict[str, Any]:
+    """
+    Return the effective {anneal_factor, anneal_interval, tau_min,
+    alpha_update_freq, entropy_threshold, auc_patience} after applying
+    --no-contrib-b/c/d overrides.
+
+    Single source of truth shared by this module's CLI and
+    scripts/run_ablations.py, so the two entry points can't drift apart.
+    """
+    return dict(
+        anneal_factor     = anneal_factor if not no_contrib_b else 1.0,
+        anneal_interval   = anneal_interval if not no_contrib_b else 9999,
+        tau_min           = tau_min if not no_contrib_b else tau_init,
+        alpha_update_freq = alpha_freq if not no_contrib_c else 1,
+        entropy_threshold = entropy_thresh if not no_contrib_d else 0.0,
+        auc_patience      = auc_patience if not no_contrib_d else 99999,
+    )
 
 
 if __name__ == "__main__":
@@ -130,13 +172,18 @@ if __name__ == "__main__":
     logger.info(f"Active tasks: {task_ids}")
 
     # Apply ablation overrides before passing to run_search.
-    tau_init_eff      = args.tau_init
-    anneal_factor_eff = args.anneal_factor if not args.no_contrib_b else 1.0
-    anneal_int_eff    = args.anneal_interval if not args.no_contrib_b else 9999
-    tau_min_eff       = args.tau_min if not args.no_contrib_b else args.tau_init
-    alpha_freq_eff    = args.alpha_freq if not args.no_contrib_c else 1
-    entropy_eff       = args.entropy_thresh if not args.no_contrib_d else 0.0
-    auc_patience_eff  = args.auc_patience if not args.no_contrib_d else 99999
+    overrides = apply_ablation_overrides(
+        tau_init        = args.tau_init,
+        anneal_factor   = args.anneal_factor,
+        anneal_interval = args.anneal_interval,
+        tau_min         = args.tau_min,
+        alpha_freq      = args.alpha_freq,
+        entropy_thresh  = args.entropy_thresh,
+        auc_patience    = args.auc_patience,
+        no_contrib_b    = args.no_contrib_b,
+        no_contrib_c    = args.no_contrib_c,
+        no_contrib_d    = args.no_contrib_d,
+    )
 
     run_search(
         num_epochs        = args.epochs,
@@ -157,13 +204,13 @@ if __name__ == "__main__":
         device_str        = args.device,
         seed              = args.seed,
         num_workers       = args.workers,
-        tau_init          = tau_init_eff,
-        anneal_factor     = anneal_factor_eff,
-        anneal_interval   = anneal_int_eff,
-        tau_min           = tau_min_eff,
-        alpha_update_freq = alpha_freq_eff,
-        entropy_threshold = entropy_eff,
-        auc_patience      = auc_patience_eff,
+        tau_init          = args.tau_init,
+        anneal_factor     = overrides["anneal_factor"],
+        anneal_interval   = overrides["anneal_interval"],
+        tau_min           = overrides["tau_min"],
+        alpha_update_freq = overrides["alpha_update_freq"],
+        entropy_threshold = overrides["entropy_threshold"],
+        auc_patience      = overrides["auc_patience"],
         rewind_thresh     = args.rewind_thresh,
         img_size          = args.img_size,
         mixup_alpha       = args.mixup_alpha,
@@ -171,4 +218,8 @@ if __name__ == "__main__":
         search_micro_batch= args.search_micro_batch,
         use_tta           = args.tta,
         task_ids          = task_ids,
+        use_sparsemax     = (args.alpha_normalizer == "sparsemax"),
+        task_normalize    = not args.no_task_normalize,
+        arch_reg_lambda   = args.arch_reg_lambda,
+        balance_tasks     = not args.no_task_balance,
     )

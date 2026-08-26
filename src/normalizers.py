@@ -65,3 +65,20 @@ def annealed_sparsemax(
         dim : Normalisation dimension.
     """
     return sparsemax(z / tau, dim=dim)
+
+
+def annealed_softmax(
+    z:   Tensor,
+    tau: float = 1.0,
+    dim: int   = -1,
+) -> Tensor:
+    """
+    Temperature-scaled softmax — the non-sparse counterpart to
+    :func:`annealed_sparsemax`, used for the sparsemax-vs-softmax ablation.
+
+    Unlike sparsemax, never produces exact zeros, so every operation always
+    receives some gradient signal. Divides ``z`` by ``tau`` before the
+    softmax, matching ``annealed_sparsemax``'s temperature semantics so call
+    sites can swap between the two via a single flag with no other changes.
+    """
+    return torch.softmax(z / tau, dim=dim)

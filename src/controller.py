@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from .losses import task_loss
-from .normalizers import annealed_sparsemax
+from .normalizers import annealed_sparsemax, annealed_softmax
 from .supernet import TaskAwareSupernet
 
 logger = logging.getLogger("MT-DARTS")
@@ -61,11 +61,24 @@ class SearchController:
         search_micro_batch:int   = 0,
         label_smoothing:   float = 0.0,
         arch_reg_lambda:   float = 0.01,   # entropy regularisation strength
+        use_sparsemax:     bool  = True,   # ablation: sparsemax vs softmax
+        task_normalize:    bool  = True,   # ablation: task-equal vs sample-weighted loss
     ) -> None:
         self.model             = model
         self.grad_clip         = grad_clip
         self.num_tasks         = model.num_tasks
         self._step             = 0
+
+        # Ablation: alpha normaliser used for the entropy term and diagnostics
+        # (the forward-pass normaliser lives on the model itself, see
+        # TaskAwareSupernet.use_sparsemax — kept in sync by the caller so both
+        # halves of the search use the same normaliser).
+        self.use_sparsemax     = use_sparsemax
+        self._alpha_normalizer = annealed_sparsemax if use_sparsemax else annealed_softmax
+
+        # Ablation: task-normalised (equal-weight per task) vs sample-weighted
+        # loss averaging — see docstring on _compute_loss below.
+        self.task_normalize    = task_normalize
 
         # Contrib. [B] — temperature annealing
         self.tau_init          = tau_init
@@ -117,12 +130,14 @@ class SearchController:
     ) -> torch.Tensor:
         """Task-normalised loss: equal weight per task regardless of sample count.
 
-        Previous behaviour was sample-weighted averaging, which let PathMNIST
-        (90k samples) dominate over DermaMNIST (7k).  Now each task's mean
-        loss contributes equally so architecture search is not biased toward
-        the largest dataset.
+        When ``self.task_normalize`` is False (ablation), falls back to the
+        previous sample-weighted averaging behaviour, which let PathMNIST
+        (90k samples) dominate over DermaMNIST (7k). The default (True) makes
+        each task's mean loss contribute equally so architecture search is
+        not biased toward the largest dataset.
         """
         task_losses = []
+        task_counts = []
 
         for k in range(self.num_tasks):
             mask = (task_ids == k)
@@ -138,12 +153,23 @@ class SearchController:
                                  self.label_smoothing,
                                  is_multilabel=(k in self.model.MULTILABEL_TASKS))
             task_losses.append(loss_k)
+            task_counts.append(int(mask.sum().item()))
 
         if not task_losses:
             return torch.tensor(0.0, device=device)
 
-        # Equal-weight mean across tasks (not across samples).
-        task_loss_mean = sum(task_losses) / len(task_losses)
+        if self.task_normalize:
+            # Equal-weight mean across tasks (not across samples).
+            task_loss_mean = sum(task_losses) / len(task_losses)
+        else:
+            # Sample-count-weighted mean — recovers the pre-task-normalisation
+            # behaviour (ablation). Each task_loss is already a mean over its
+            # own subset, so weighting by subset size and dividing by the
+            # total batch size gives the true global per-sample mean loss.
+            total_n = sum(task_counts)
+            task_loss_mean = sum(
+                l * n for l, n in zip(task_losses, task_counts)
+            ) / total_n
 
         # ── Architecture entropy regularisation ───────────────────────────────
         # Maximise entropy of sparsemax(α) across all tasks and layers.
@@ -156,7 +182,7 @@ class SearchController:
         # entropy is equivalent to maximising it.
         # Only applied when lambda > 0 to allow easy ablation (set to 0.0).
         if self.arch_reg_lambda > 0.0:
-            soft = annealed_sparsemax(self.model.alphas, tau=self._current_tau)
+            soft = self._alpha_normalizer(self.model.alphas, tau=self._current_tau)
             # Clamp to avoid log(0); sparsemax can produce exact zeros.
             entropy = -(soft * soft.clamp(min=1e-9).log()).sum(dim=-1).mean()
             arch_reg = -self.arch_reg_lambda * entropy
@@ -368,12 +394,13 @@ class SearchController:
         from .ops import OP_NAMES  # local import avoids top-level cycle
         from .data import TASK_REGISTRY
 
+        _normalizer_name = "sparsemax" if self.use_sparsemax else "softmax"
         logger.info(
             f"\n[step {self._step}] Architecture distribution "
-            f"(sparsemax α, τ={self._current_tau:.4f})"
+            f"({_normalizer_name} α, τ={self._current_tau:.4f})"
             f"  LR={self.scheduler.get_last_lr()[0]:.5f}"
         )
-        soft = annealed_sparsemax(self.model.alphas, tau=self._current_tau)
+        soft = self._alpha_normalizer(self.model.alphas, tau=self._current_tau)
         for t in range(self.num_tasks):
             registry_id = self.model.task_ids[t]
             name = TASK_REGISTRY.get(registry_id, (f"Task{t}",))[0]

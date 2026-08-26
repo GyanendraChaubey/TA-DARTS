@@ -39,12 +39,20 @@ def _calibrate_chest_thresholds(
     n_labels:   int = 14,
 ) -> np.ndarray:
     """
-    Find per-label decision thresholds that maximise multi-label accuracy
-    on the validation set for ChestMNIST.
+    Find per-label decision thresholds that maximise per-label F1 on the
+    validation set for ChestMNIST.
 
-    Sweeps 20 evenly-spaced thresholds in [0.05, 0.95] per label and picks
-    the one with the highest per-label accuracy.  Returns an array of shape
-    (n_labels,) used at test-time instead of the fixed 0.5.
+    Sweeps 49 evenly-spaced thresholds in [0.02, 0.98] per label and picks
+    the one with the highest F1.  Returns an array of shape (n_labels,) used
+    at test-time instead of the fixed 0.5.
+
+    Accuracy is *not* used as the calibration objective: with label
+    prevalence as low as ~0.2%, the accuracy-maximising threshold degenerates
+    to "always predict negative" (trivially ~99.8% accurate, but recall = 0).
+    F1 penalises that collapse directly.  Labels with zero positives in the
+    validation split are left at the default 0.5 — every threshold is
+    equally uninformative for them (F1 = 0 everywhere), so there is no
+    signal to calibrate against.
 
     Args:
         task_id : Position of ChestMNIST within the DataLoader's active task
@@ -75,11 +83,19 @@ def _calibrate_chest_thresholds(
     best_thresholds = np.full(n_labels, 0.5)
 
     for c in range(n_labels):
-        best_acc = -1.0
-        for thr in np.linspace(0.05, 0.95, 20):
-            acc = np.mean((y_score[:, c] >= thr) == y_true[:, c])
-            if acc > best_acc:
-                best_acc = acc
+        n_pos = y_true[:, c].sum()
+        if n_pos == 0:
+            continue  # no positive examples to calibrate against — keep 0.5
+        best_f1 = -1.0
+        for thr in np.linspace(0.02, 0.98, 49):
+            pred = y_score[:, c] >= thr
+            tp = np.logical_and(pred, y_true[:, c] == 1).sum()
+            fp = np.logical_and(pred, y_true[:, c] == 0).sum()
+            fn = np.logical_and(~pred, y_true[:, c] == 1).sum()
+            denom = 2 * tp + fp + fn
+            f1 = (2 * tp / denom) if denom > 0 else 0.0
+            if f1 > best_f1:
+                best_f1 = f1
                 best_thresholds[c] = thr
 
     logger.info(
@@ -495,7 +511,8 @@ def retrain_discrete(
         discrete_model.load_state_dict(best_state)
 
     # ChestMNIST: calibrate per-label thresholds on val set before test eval
-    # to maximise multi-label accuracy (fixed 0.5 is suboptimal with pos_weight=10).
+    # to maximise per-label F1 (fixed 0.5 is suboptimal with calibrated pos_weight,
+    # and accuracy-maximising thresholds collapse to all-negative on rare labels).
     if registry_id == 1:
         chest_thresholds = _calibrate_chest_thresholds(
             discrete_model, val_loader, device, task_id,
