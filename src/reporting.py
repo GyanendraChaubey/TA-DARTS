@@ -65,7 +65,7 @@ def print_benchmark_table(
     lines = [
         "",
         sep,
-        "  MT-DARTS v2 — Benchmark Results on MedMNIST",
+        "  MT-DARTS — Benchmark Results on MedMNIST",
         sep,
         header,
         "─" * 138,
@@ -243,7 +243,7 @@ def print_ablation_table(
     lines = [
         "",
         sep,
-        "  MT-DARTS v2 — Ablation Comparison",
+        "  MT-DARTS — Ablation Comparison",
         sep,
         header,
         "─" * 118,

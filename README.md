@@ -1,6 +1,9 @@
-# MT-DARTS v2 — Multi-Task Neural Architecture Search on MedMNIST
+# MT-DARTS: Multi-Task Differentiable Architecture Search for Multi-Modal Medical Image Classification
 
-MT-DARTS v2 jointly searches for per-task neural architectures across the
+**[Project page](https://gyanendrachaubey.github.io/MT-DARTS/)** ·
+**[Paper (PDF)](https://gyanendrachaubey.github.io/MT-DARTS/assets/pdf/mt_darts_paper.pdf)**
+
+MT-DARTS jointly searches for per-task neural architectures across the
 MedMNIST benchmark suite in a single differentiable pass, then retrains each
 discovered architecture from scratch. It runs 3 tasks by default; any subset
 of the 12-task MedMNIST registry can be selected with `--tasks`.

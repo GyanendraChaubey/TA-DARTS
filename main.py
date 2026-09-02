@@ -1,5 +1,5 @@
 """
-CLI entry point for MT-DARTS v2.
+CLI entry point for MT-DARTS.
 
 Examples
 --------
@@ -28,7 +28,7 @@ except ImportError:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="MT-DARTS v2: Multi-Task NAS on MedMNIST",
+        description="MT-DARTS: Multi-Task NAS on MedMNIST",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 

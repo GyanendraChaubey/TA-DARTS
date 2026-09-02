@@ -1,5 +1,5 @@
 """
-Evaluation metrics for MT-DARTS v2.
+Evaluation metrics for MT-DARTS.
 
   evaluate_task()  — per-task acc + AUC + F1 + precision + recall + loss.
   evaluate()       — all-task evaluation returning a dict of metrics.

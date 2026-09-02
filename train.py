@@ -1,5 +1,5 @@
 """
-run_search() — full MT-DARTS v2 pipeline.
+run_search() — full MT-DARTS pipeline.
 
 Phases:
   A — Architecture search (bilevel optimisation with early stopping).
@@ -85,7 +85,7 @@ def run_search(
     task_ids:          Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """
-    Execute the full MT-DARTS v2 pipeline and return benchmark results.
+    Execute the full MT-DARTS pipeline and return benchmark results.
 
     Returns
     -------
@@ -159,7 +159,7 @@ def run_search(
 
     logger.info("=" * 72)
     logger.info(
-        f"MT-DARTS v2  |  device={device}  |  epochs={num_epochs}"
+        f"MT-DARTS  |  device={device}  |  epochs={num_epochs}"
         f"  |  seed={seed}"
     )
     logger.info(

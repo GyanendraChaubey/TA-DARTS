@@ -1,5 +1,5 @@
 """
-SearchController — bilevel optimisation engine for MT-DARTS v2.
+SearchController — bilevel optimisation engine for MT-DARTS.
 
 Design:
   Phase 1  — update weight parameters (alphas frozen).

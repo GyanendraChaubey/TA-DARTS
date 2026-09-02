@@ -1,5 +1,5 @@
 """
-MT-DARTS v2 — modular package.
+MT-DARTS — modular package.
 
 Quick imports::
 

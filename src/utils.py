@@ -1,5 +1,5 @@
 """
-Utility helpers shared across MT-DARTS v2.
+Utility helpers shared across MT-DARTS.
 
   set_seed()         — reproducible RNG initialisation.
   _make_divisible()  — channel-width rounding used by MBConv.

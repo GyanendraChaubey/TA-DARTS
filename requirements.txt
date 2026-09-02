@@ -1,4 +1,4 @@
-# MT-DARTS v2 — dependencies
+# MT-DARTS — dependencies
 # Install with:  pip install -r requirements.txt
 
 # ── Core framework ────────────────────────────────────────────────────────────
