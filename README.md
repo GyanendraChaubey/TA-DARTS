@@ -1,7 +1,9 @@
 # MT-DARTS: Multi-Task Differentiable Architecture Search for Multi-Modal Medical Image Classification
 
-**[Project page](https://gyanendrachaubey.github.io/MT-DARTS/)** ·
-**[Paper (PDF)](https://gyanendrachaubey.github.io/MT-DARTS/assets/pdf/mt_darts_paper.pdf)**
+**[Project page](https://gyanendrachaubey.github.io/MT-DARTS/)**
+
+> Paper is still under correction — not yet public. It'll be posted to
+> arXiv and linked here once finalised.
 
 MT-DARTS jointly searches for per-task neural architectures across the
 MedMNIST benchmark suite in a single differentiable pass, then retrains each
